@@ -1,0 +1,10 @@
+procs:
+  frontend:
+    cwd: .
+    shell: npm run dev
+    autostart: true
+
+  server:
+    cwd: .
+    shell: cargo run -p app
+    autostart: true
