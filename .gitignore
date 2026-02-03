@@ -1,8 +1,10 @@
+.env
+
+**/target
+dist/
+
 /node_modules
 /.svelte-kit
 /build
 
 mprocs.log
-
-**/target
-dist/

@@ -1,19 +1,7 @@
-[package]
-name = "rlm-rs"
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[[bin]]
-name = "rlm-rs"
-path = "crates/rlm/src/main.rs"
-test = false
-
 [workspace]
-members = ["crates/app", "crates/rlm"]
+members = ["crates/rlm"]
 resolver = "3"
+default-members = ["crates/rlm"]
 
 [workspace.package]
 edition = "2024"

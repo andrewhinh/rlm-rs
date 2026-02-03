@@ -18,7 +18,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: stable
           components: rustfmt
 
       - run: cargo fmt -- --check
@@ -32,19 +32,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: stable
           components: clippy, rust-src
-          targets: riscv64gc-unknown-none-elf
-
-      - run: sudo apt update && sudo apt install -y qemu-system-riscv64
 
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo clippy -- -D warnings
 
-      - run: cargo test --workspace --exclude libkernel
-
-      - run: cd crates/kernel && cargo test
+      - run: cargo test --workspace
 
   web:
     name: Web lint, check, and build
