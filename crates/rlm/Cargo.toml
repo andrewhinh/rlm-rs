@@ -1,0 +1,25 @@
+[package]
+name = "rlm"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+dotenvy = "0.15.7"
+rand = "0.9.2"
+regex = "1.12.2"
+reqwest = { version = "0.13.1", features = ["blocking", "json"] }
+rustpython-pylib = { git = "https://github.com/RustPython/RustPython", version = "0.4.0", features = [
+    "freeze-stdlib",
+] }
+rustpython-stdlib = { git = "https://github.com/RustPython/RustPython", version = "0.4.0" }
+rustpython-vm = { git = "https://github.com/RustPython/RustPython", version = "0.4.0", features = [
+    "freeze-stdlib",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tempfile = "3.24.0"
+thiserror = "2.0.18"
