@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rlm"]
+members = ["crates/app", "crates/rlm"]
 resolver = "3"
 default-members = ["crates/rlm"]
 
