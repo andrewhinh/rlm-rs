@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::llm::{LlmClient, LlmClientImpl, Message};
 use crate::logger::{Logger, ReplEnvLogger};
 use crate::prompts::{DEFAULT_QUERY, build_system_prompt, next_action_prompt};
-use crate::repl::ReplEnv;
+use crate::repl::{ReplEnv, ReplResult};
 use crate::utils::{
     ContextInput, check_for_final_answer, convert_context_for_repl, find_code_blocks,
     process_code_execution,
@@ -89,13 +89,37 @@ impl RlmRepl {
             .query
             .clone()
             .unwrap_or_else(|| DEFAULT_QUERY.to_owned());
+        self.run_completion_loop(&query)
+    }
+
+    pub fn completion_with_existing(&mut self, query: Option<&str>) -> anyhow::Result<String> {
+        if self.repl_env.is_none() {
+            anyhow::bail!("repl env not initialized");
+        }
+        let query = query.unwrap_or(DEFAULT_QUERY).to_owned();
+        self.query = Some(query.clone());
+        self.logger.log_query_start(&query);
+        self.messages = build_system_prompt();
+        self.logger.log_initial_messages(&self.messages);
+        self.run_completion_loop(&query)
+    }
+
+    pub fn execute_code(&mut self, code: &str) -> anyhow::Result<ReplResult> {
+        let repl_env = self
+            .repl_env
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
+        repl_env.execute(code)
+    }
+
+    fn run_completion_loop(&mut self, query: &str) -> anyhow::Result<String> {
         let repl_env = self
             .repl_env
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
 
         for iteration in 0..self.max_iterations {
-            let prompt = next_action_prompt(&query, iteration, false);
+            let prompt = next_action_prompt(query, iteration, false);
             let mut messages = self.messages.clone();
             messages.push(prompt);
 
@@ -126,7 +150,7 @@ impl RlmRepl {
         }
 
         println!("No final answer found in any iteration");
-        let final_prompt = next_action_prompt(&query, self.max_iterations, true);
+        let final_prompt = next_action_prompt(query, self.max_iterations, true);
         self.messages.push(final_prompt);
         let final_answer = self.llm.completion(&self.messages, None)?;
         self.logger.log_final_response(&final_answer);

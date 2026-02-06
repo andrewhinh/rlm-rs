@@ -92,7 +92,8 @@ impl ReplEnv {
             text_path = Some(escape_path(&path));
         }
 
-        self.interpreter
+        let enter_result = self
+            .interpreter
             .enter(move |vm: &vm::VirtualMachine| -> vm::PyResult<()> {
             let llm_client = llm_client.clone();
             let llm_fn = vm.new_function(
@@ -108,16 +109,25 @@ impl ReplEnv {
             scope
                 .globals
                 .set_item("__rlm_llm_query", llm_fn.into(), vm)?;
-
-            let init_code = r#"
-import builtins as __rlm_builtins
-import json
-
-__rlm_exec_builtin = __rlm_builtins.exec
-__rlm_eval_builtin = __rlm_builtins.eval
-__rlm_globals_builtin = __rlm_builtins.globals
-
-__rlm_safe_builtin_names = [
+            let init_segments = [
+                (
+                    "builtins_ref",
+                    r#"__rlm_builtins = __builtins__
+if isinstance(__rlm_builtins, dict):
+    def __rlm_get_builtin(name):
+        return __rlm_builtins.get(name)
+else:
+    def __rlm_get_builtin(name):
+        return getattr(__rlm_builtins, name, None)
+"#,
+                ),
+                (
+                    "builtin_refs",
+                    "__rlm_exec_builtin = __rlm_get_builtin('exec')\n__rlm_eval_builtin = __rlm_get_builtin('eval')\n__rlm_globals_builtin = __rlm_get_builtin('globals')\n",
+                ),
+                (
+                    "safe_list",
+                    r#"__rlm_safe_builtin_names = [
     "print", "len", "str", "int", "float", "list", "dict", "set", "tuple", "bool",
     "type", "isinstance", "enumerate", "zip", "map", "filter", "sorted", "min", "max",
     "sum", "abs", "round", "chr", "ord", "hex", "bin", "oct", "repr", "ascii", "format",
@@ -131,35 +141,42 @@ __rlm_safe_builtin_names = [
     "ResourceWarning", "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
     "AttributeError", "FileNotFoundError", "OSError", "IOError", "RuntimeError", "NameError",
     "ImportError", "StopIteration", "GeneratorExit", "SystemExit", "KeyboardInterrupt",
-]
-
-__rlm_safe_builtins = {}
-for __rlm_name in __rlm_safe_builtin_names:
-    if hasattr(__rlm_builtins, __rlm_name):
-        __rlm_safe_builtins[__rlm_name] = getattr(__rlm_builtins, __rlm_name)
-
-for __rlm_name in ["input", "eval", "exec", "compile", "globals", "locals"]:
-    __rlm_safe_builtins[__rlm_name] = None
-
-__builtins__ = __rlm_safe_builtins
-
-__rlm_locals = {}
-
-def llm_query(prompt):
+]"#,
+                ),
+                (
+                    "safe_builtins",
+                    "__rlm_safe_builtins = {}\nfor __rlm_name in __rlm_safe_builtin_names:\n    __rlm_value = __rlm_get_builtin(__rlm_name)\n    if __rlm_value is not None:\n        __rlm_safe_builtins[__rlm_name] = __rlm_value\n",
+                ),
+                (
+                    "safe_blocklist",
+                    "for __rlm_name in [\"input\", \"eval\", \"exec\", \"compile\", \"globals\", \"locals\"]:\n    __rlm_safe_builtins[__rlm_name] = None\n",
+                ),
+                ("builtins_assign", "__builtins__ = __rlm_safe_builtins\n"),
+                ("locals_init", "__rlm_locals = {}\n"),
+                (
+                    "llm_query",
+                    r#"def llm_query(prompt):
     if not isinstance(prompt, str):
         try:
-            prompt = json.dumps(prompt)
+            __rlm_json = __rlm_get_builtin('__import__')('json')
+            prompt = __rlm_json.dumps(prompt)
         except Exception:
             prompt = str(prompt)
     return __rlm_llm_query(prompt)
-
-def FINAL_VAR(name):
+"#,
+                ),
+                (
+                    "final_var",
+                    r#"def FINAL_VAR(name):
     name = name.strip().strip('"').strip("'").strip('\n').strip('\r')
     if name in __rlm_locals:
         return __rlm_locals[name]
     return f"Error: Variable '{name}' not found in REPL environment"
-
-def __rlm_exec(code):
+"#,
+                ),
+                (
+                    "rlm_exec",
+                    r#"def __rlm_exec(code):
     __rlm_globals = __rlm_globals_builtin()
     lines = code.split('\n')
     import_lines = []
@@ -213,10 +230,14 @@ def __rlm_exec(code):
         for key, value in combined_namespace.items():
             if key not in __rlm_globals:
                 __rlm_locals[key] = value
-"#;
-            vm.run_string(scope.clone(), init_code, "<rlm_init>".to_owned())?;
+"#,
+                ),
+            ];
 
-            if let Some(path_str) = json_path {
+            for (label, code) in init_segments {
+                vm.run_string(scope.clone(), code, format!("<rlm_init_{label}>"))?;
+            }
+            if let Some(ref path_str) = json_path {
                 let code = format!(
                     "import json\nwith open(r\"{path_str}\", \"r\") as f:\n    context = json.load(f)\n"
                 );
@@ -226,7 +247,7 @@ def __rlm_exec(code):
                 vm.run_string(scope.clone(), "__rlm_exec(__rlm_code)\n", "<rlm_context_json>".to_owned())?;
             }
 
-            if let Some(path_str) = text_path {
+            if let Some(ref path_str) = text_path {
                 let code = format!(
                     "with open(r\"{path_str}\", \"r\") as f:\n    context = f.read()\n"
                 );
@@ -236,10 +257,10 @@ def __rlm_exec(code):
                 vm.run_string(scope.clone(), "__rlm_exec(__rlm_code)\n", "<rlm_context_text>".to_owned())?;
             }
             Ok(())
-        })
-            .map_err(|err: vm::PyRef<PyBaseException>| {
-                anyhow::anyhow!("python init error: {err:?}")
-            })?;
+        });
+        enter_result.map_err(|err: vm::PyRef<PyBaseException>| {
+            anyhow::anyhow!("python init error: {err:?}")
+        })?;
 
         Ok(())
     }
