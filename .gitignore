@@ -11,5 +11,4 @@ mprocs.log
 
 rlm-rs.pem
 
-report.json
-request.json
+logs/

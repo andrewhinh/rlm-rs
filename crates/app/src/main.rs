@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use rlm::llm::Message;
+use rlm::llm::{LlmClient, LlmClientImpl, LlmUsage, Message};
 use rlm::prompts::DEFAULT_QUERY;
 use rlm::rlm::{RlmConfig, RlmRepl};
 use rlm::utils::ContextInput;
@@ -29,6 +30,8 @@ struct AppConfig {
     depth: usize,
     enable_logging: bool,
     disable_recursive: bool,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<String>,
 }
 
 impl AppConfig {
@@ -42,6 +45,8 @@ impl AppConfig {
             depth: self.depth,
             enable_logging: self.enable_logging,
             disable_recursive: self.disable_recursive,
+            prompt_cache_key: self.prompt_cache_key.clone(),
+            prompt_cache_retention: self.prompt_cache_retention.clone(),
         }
     }
 }
@@ -49,6 +54,7 @@ impl AppConfig {
 #[derive(Clone)]
 struct AppState {
     sender: Arc<std::sync::Mutex<Sender<SessionRequest>>>,
+    config: AppConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +71,24 @@ struct ReplResponse {
     response: Option<String>,
     stdout: Option<String>,
     stderr: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmRequest {
+    messages: Option<Vec<Message>>,
+    prompt: Option<String>,
+    model: Option<String>,
+    max_output_tokens: Option<u32>,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LlmResponse {
+    content: String,
+    model: String,
+    latency_secs: f64,
+    usage: Option<LlmUsage>,
 }
 
 struct SessionRequest {
@@ -127,6 +151,57 @@ async fn repl_handler(
             .insert(header::SET_COOKIE, header_value);
     }
     Ok(response)
+}
+
+async fn llm_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<LlmRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let LlmRequest {
+        messages,
+        prompt,
+        model,
+        max_output_tokens,
+        prompt_cache_key,
+        prompt_cache_retention,
+    } = payload;
+    let messages = match (messages, prompt) {
+        (Some(messages), _) => messages,
+        (None, Some(prompt)) => vec![Message::user(prompt)],
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "messages or prompt required".to_owned(),
+            ));
+        }
+    };
+    let model = model.unwrap_or_else(|| state.config.model.clone());
+    let prompt_cache_key = prompt_cache_key.or_else(|| state.config.prompt_cache_key.clone());
+    let prompt_cache_retention =
+        prompt_cache_retention.or_else(|| state.config.prompt_cache_retention.clone());
+    let client = LlmClientImpl::new(
+        state.config.api_key.clone(),
+        state.config.base_url.clone(),
+        model.clone(),
+        prompt_cache_key,
+        prompt_cache_retention,
+    );
+    let start = Instant::now();
+    let completion = match client.completion(&messages, max_output_tokens).await {
+        Ok(completion) => completion,
+        Err(err) => {
+            eprintln!("llm error: {err}");
+            return Err(internal_error(err));
+        }
+    };
+    let latency_secs = start.elapsed().as_secs_f64();
+    let response = LlmResponse {
+        content: completion.content,
+        model,
+        latency_secs,
+        usage: completion.usage,
+    };
+    Ok(Json(response).into_response())
 }
 
 fn context_from_value(value: Option<Value>) -> ContextInput {
@@ -201,6 +276,11 @@ fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 fn spawn_session_worker(config: AppConfig) -> Arc<std::sync::Mutex<Sender<SessionRequest>>> {
     let (sender, receiver) = mpsc::channel::<SessionRequest>();
     std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("session runtime");
         let mut sessions: HashMap<String, RlmRepl> = HashMap::new();
         while let Ok(req) = receiver.recv() {
             let SessionRequest {
@@ -212,7 +292,7 @@ fn spawn_session_worker(config: AppConfig) -> Arc<std::sync::Mutex<Sender<Sessio
                 respond_to,
             } = req;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_session_request_inner(
+                rt.block_on(handle_session_request_inner(
                     &config,
                     &mut sessions,
                     session_id,
@@ -220,7 +300,7 @@ fn spawn_session_worker(config: AppConfig) -> Arc<std::sync::Mutex<Sender<Sessio
                     query,
                     context,
                     code,
-                )
+                ))
             }));
             let result = match result {
                 Ok(r) => r,
@@ -242,7 +322,7 @@ fn spawn_session_worker(config: AppConfig) -> Arc<std::sync::Mutex<Sender<Sessio
     Arc::new(std::sync::Mutex::new(sender))
 }
 
-fn handle_session_request_inner(
+async fn handle_session_request_inner(
     config: &AppConfig,
     sessions: &mut HashMap<String, RlmRepl>,
     session_id: String,
@@ -279,9 +359,11 @@ fn handle_session_request_inner(
 
     let response = if is_new_session || reset {
         repl.completion(context, Some(&query))
+            .await
             .map_err(|err| err.to_string())?
     } else {
         repl.completion_with_existing(Some(&query))
+            .await
             .map_err(|err| err.to_string())?
     };
     Ok(ReplResponse {
@@ -304,11 +386,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         depth: 1,
         enable_logging: false,
         disable_recursive: false,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
 
     // spawn session worker before tokio runtime so RustPython remains single-threaded (gVisor issue)
-    let sender = spawn_session_worker(config);
-    let state = AppState { sender };
+    let sender = spawn_session_worker(config.clone());
+    let state = AppState { sender, config };
 
     let host = "0.0.0.0".to_string();
     let port = 3000;
@@ -321,6 +405,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async move {
         let app = Router::new()
             .route("/healthz", get(healthcheck))
+            .route(
+                "/llm",
+                post(llm_handler).layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+            )
             .route("/repl", post(repl_handler))
             .with_state(state);
 

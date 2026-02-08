@@ -31,7 +31,8 @@ fn generate_massive_context(num_lines: usize, answer: &str) -> String {
     lines.join("\n")
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     println!("Example of using RLM (REPL) with GPT-5-nano on a needle-in-haystack problem.");
     let answer: String = rand::rng().random_range(1_000_000..9_999_999).to_string();
@@ -47,10 +48,12 @@ fn main() -> anyhow::Result<()> {
         enable_logging: true,
         max_iterations: 10,
         disable_recursive: false,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
     let mut rlm = RlmRepl::new(config)?;
     let query = "I'm looking for a magic number. What is it?";
-    let result = rlm.completion(context, Some(query))?;
+    let result = rlm.completion(context, Some(query)).await?;
 
     println!("Result: {result}. Expected: {answer}");
     Ok(())

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::llm::Message;
+use crate::llm::{LlmUsage, Message};
 
 #[derive(Clone, Debug)]
 struct CodeExecution {
@@ -105,6 +105,37 @@ impl Logger {
         println!("{response}");
         self._print_separator('=');
         println!();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LlmMetricsLogger {
+    enabled: bool,
+}
+
+impl LlmMetricsLogger {
+    pub fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    pub fn log_call(&self, label: &str, elapsed_secs: f64, usage: Option<&LlmUsage>) {
+        if !self.enabled {
+            return;
+        }
+        let (cached, input, output, total) = usage
+            .map(|u| {
+                (
+                    u.cached_input_tokens,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.total_tokens,
+                )
+            })
+            .unwrap_or((None, None, None, None));
+        println!(
+            "LLM CALL [{label}] {elapsed_secs:.3}s cached={:?} input={:?} output={:?} total={:?}",
+            cached, input, output, total
+        );
     }
 }
 
