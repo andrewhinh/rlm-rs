@@ -59,6 +59,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "goose",
+ "rand 0.9.2",
  "reqwest 0.11.27",
  "rlm",
  "serde",
@@ -2623,9 +2624,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
- "futures-util",
  "h2 0.4.13",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -2696,6 +2695,7 @@ name = "rlm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dotenvy",
  "rand 0.9.2",
  "regex",
@@ -2707,6 +2707,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

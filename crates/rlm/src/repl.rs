@@ -9,8 +9,11 @@ use rustpython_vm::builtins::{PyBaseException, PyDictRef};
 use rustpython_vm::scope::Scope;
 use rustpython_vm::{Interpreter, InterpreterBuilder};
 use tempfile::TempDir;
+use tokio::runtime::Handle;
+use tokio::task::{JoinSet, block_in_place};
 
 use crate::llm::{LlmClient, Message};
+use crate::logger::LlmMetricsLogger;
 use crate::utils::ContextData;
 
 #[derive(Clone, Debug)]
@@ -35,6 +38,7 @@ pub struct ReplEnv {
     scope: Scope,
     temp_dir: TempDir,
     llm_client: Arc<dyn LlmClient>,
+    llm_metrics: LlmMetricsLogger,
     execution_lock: Mutex<()>,
 }
 
@@ -42,6 +46,7 @@ impl ReplEnv {
     pub fn new(
         context: ContextData,
         llm_client: Arc<dyn LlmClient>,
+        llm_metrics: LlmMetricsLogger,
         setup_code: Option<&str>,
     ) -> anyhow::Result<Self> {
         let builder = InterpreterBuilder::new();
@@ -63,6 +68,7 @@ impl ReplEnv {
             scope,
             temp_dir,
             llm_client,
+            llm_metrics,
             execution_lock: Mutex::new(()),
         };
         env.initialize(context)?;
@@ -74,6 +80,7 @@ impl ReplEnv {
 
     fn initialize(&mut self, context: ContextData) -> anyhow::Result<()> {
         let llm_client = self.llm_client.clone();
+        let llm_metrics = self.llm_metrics.clone();
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
         let mut json_path: Option<String> = None;
@@ -95,15 +102,64 @@ impl ReplEnv {
         let enter_result = self
             .interpreter
             .enter(move |vm: &vm::VirtualMachine| -> vm::PyResult<()> {
-            let llm_client = llm_client.clone();
+            let llm_client_many = llm_client.clone();
+            let llm_metrics_many = llm_metrics.clone();
             let llm_fn = vm.new_function(
                 "__rlm_llm_query",
-                move |prompt: String| -> vm::PyResult<String> {
-                    let messages = parse_llm_prompt(&prompt);
-                    let response = llm_client
-                        .completion(&messages, None)
-                        .unwrap_or_else(|err| format!("Error making LLM query: {err}"));
-                    Ok(response)
+                move |prompts_json: String| -> vm::PyResult<String> {
+                    let prompts: Vec<String> = match serde_json::from_str(&prompts_json) {
+                        Ok(prompts) => prompts,
+                        Err(err) => {
+                            return Ok(format!("Error parsing prompts: {err}"));
+                        }
+                    };
+                    if prompts.is_empty() {
+                        return Ok("[]".to_owned());
+                    }
+                    let handle = Handle::current();
+                    let llm_client = llm_client_many.clone();
+                    let llm_metrics = llm_metrics_many.clone();
+                    let results = block_in_place(|| {
+                        handle.block_on(async move {
+                            let mut set = JoinSet::new();
+                            for (idx, prompt) in prompts.iter().enumerate() {
+                                let messages = parse_llm_prompt(prompt);
+                                let client = llm_client.clone();
+                                set.spawn(async move {
+                                    let start = Instant::now();
+                                    let result = client.completion(&messages, None).await;
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    (idx, result, elapsed)
+                                });
+                            }
+                            let mut outputs = vec![String::new(); prompts.len()];
+                            while let Some(joined) = set.join_next().await {
+                                match joined {
+                                    Ok((idx, Ok(result), elapsed)) => {
+                                        llm_metrics.log_call(
+                                            "recursive_many",
+                                            elapsed,
+                                            result.usage.as_ref(),
+                                        );
+                                        outputs[idx] = result.content;
+                                    }
+                                    Ok((idx, Err(err), _)) => {
+                                        outputs[idx] =
+                                            format!("Error making LLM query: {err}");
+                                    }
+                                    Err(err) => {
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                            Ok(outputs)
+                        })
+                    });
+                    match results {
+                        Ok(outputs) => Ok(serde_json::to_string(&outputs)
+                            .unwrap_or_else(|_| "[]".to_owned())),
+                        Err(err) => Ok(format!("Error making LLM queries: {err}")),
+                    }
                 },
             );
             scope
@@ -155,14 +211,35 @@ else:
                 ("locals_init", "__rlm_locals = {}\n"),
                 (
                     "llm_query",
-                    r#"def llm_query(prompt):
-    if not isinstance(prompt, str):
-        try:
-            __rlm_json = __rlm_get_builtin('__import__')('json')
-            prompt = __rlm_json.dumps(prompt)
-        except Exception:
-            prompt = str(prompt)
-    return __rlm_llm_query(prompt)
+                    r#"def llm_query(prompts):
+    if not isinstance(prompts, list):
+        prompts = [prompts]
+        unwrap_single = True
+    else:
+        unwrap_single = False
+    converted = []
+    for prompt in prompts:
+        if isinstance(prompt, str):
+            converted.append(prompt)
+        else:
+            try:
+                __rlm_json = __rlm_get_builtin('__import__')('json')
+                converted.append(__rlm_json.dumps(prompt))
+            except Exception:
+                converted.append(str(prompt))
+    try:
+        __rlm_json = __rlm_get_builtin('__import__')('json')
+        payload = __rlm_json.dumps(converted)
+    except Exception:
+        payload = str(converted)
+    response = __rlm_llm_query(payload)
+    try:
+        parsed = __rlm_json.loads(response)
+        if unwrap_single and isinstance(parsed, list) and len(parsed) == 1:
+            return parsed[0]
+        return parsed
+    except Exception:
+        return response
 "#,
                 ),
                 (

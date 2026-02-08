@@ -72,12 +72,11 @@ make goose HOST=<host:port>
 
 - [x] port rlm-minimal to Rust and RustPython
 - [x] run REPL in gVisor and serve API via axum
-- [ ] unblock event loop
-- [ ] add support for depth > 1
-- [ ] add
-      [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
-- [ ] replace OpenAI LLM endpoint with Modal
-- [ ] add cost tracking
+- [x] unblock event loop + add prefix caching
+- [ ] add support for depth > 1 (need harder task to compare effect)
+- [ ] add cost tracking + outline bounds for runtime/cost per request
+- [ ] replace OpenAI LLM endpoint (+ prefix caching) with Modal
+- [ ] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
 
 ## Credit
 

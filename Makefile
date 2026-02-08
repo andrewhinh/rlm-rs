@@ -42,9 +42,10 @@ goose:
 	@if [ -z "$(HOST)" ]; then echo "HOST required"; exit 1; fi
 	cargo run -p app --bin goose -- \
 		--host "$(HOST)" \
-		--users 8 --hatch-rate 2 --run-time 30s \
-		--report-file report.json \
-		--request-log request.json --request-format json
+		--timeout 86400 \
+		--users 20 --run-time 1m \
+		--report-file logs/report-$(shell date +"%Y-%m-%d_%H-%M-%S").html \
+		--request-log logs/request-$(shell date +"%Y-%m-%d_%H-%M-%S").json
 
 conn:
 	bash scripts/conn.sh
