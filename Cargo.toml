@@ -1,0 +1,6 @@
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["Andrew Hinh <ajhinh@gmail.com>"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/andrewhinh/rlm-rs"
