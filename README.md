@@ -32,7 +32,7 @@ EC2:
 - [aws cli](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [auth setup](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-authentication.html)
 
 ```bash
-IAM_USER=<iam-user> make aws-setup          # optionally specify IAM_USER to create access key then create key pair
+IAM_USER=<iam-user> make aws-setup                          # optionally specify IAM_USER to create access key, then create key pair
 ARCH=arm64 INSTANCE_TYPE=t4g.medium ROOT_GB=50 make create  # optionally specify ARCH, INSTANCE_TYPE, ROOT_GB, then create instance
 make conn
 
@@ -63,7 +63,7 @@ make goose HOST=<host>
 
 ## Roadmap
 
-- [ ] port rlm-minimal to Rust and RustPython
+- [x] port rlm-minimal to Rust and RustPython
 - [ ] unblock event loop
 - [ ] add support for depth > 1
 - [ ] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
