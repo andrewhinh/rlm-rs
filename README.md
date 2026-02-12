@@ -65,7 +65,7 @@ make goose HOST=<host>
 
 - [x] port rlm-minimal to Rust and RustPython
 - [x] unblock event loop
-- [ ] add support for depth > 1
+- [x] add support for depth > 1
 - [ ] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
 - [ ] add per-session REPL sandboxing with gVisor
 
