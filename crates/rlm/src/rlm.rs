@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::llm::{LlmClient, LlmClientImpl, Message};
 use crate::logger::{Logger, ReplEnvLogger};
 use crate::prompts::{DEFAULT_QUERY, REPL_SYSTEM_PROMPT, build_system_prompt, next_action_prompt};
-use crate::repl::{RecursiveRunner, ReplHandle, ReplResult};
+use crate::repl::{RecursiveRunner, ReplHandle, ReplResult, SharedProgramState};
 use crate::utils::{
     ContextInput, check_for_final_answer, convert_context_for_repl, find_code_blocks,
     process_code_execution,
@@ -33,10 +33,18 @@ pub struct RlmRepl {
     query: Option<String>,
     disable_recursive: bool,
     recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+    shared_state: SharedProgramState,
 }
 
 impl RlmRepl {
     pub fn new(config: RlmConfig) -> anyhow::Result<Self> {
+        Self::new_with_shared_state(config, SharedProgramState::new())
+    }
+
+    pub(crate) fn new_with_shared_state(
+        config: RlmConfig,
+        shared_state: SharedProgramState,
+    ) -> anyhow::Result<Self> {
         let llm = make_client(
             &config.model,
             config.api_key.clone(),
@@ -48,7 +56,10 @@ impl RlmRepl {
             config.base_url.clone(),
         )?;
         let recursive_runner: Option<Arc<dyn RecursiveRunner>> = if config.depth > 0 {
-            Some(Arc::new(RlmRecursiveRunner::new(config.clone())))
+            Some(Arc::new(RlmRecursiveRunner::new(
+                config.clone(),
+                shared_state.clone(),
+            )))
         } else {
             None
         };
@@ -64,6 +75,7 @@ impl RlmRepl {
             query: None,
             disable_recursive: config.disable_recursive,
             recursive_runner,
+            shared_state,
         })
     }
 
@@ -85,6 +97,7 @@ impl RlmRepl {
                 self.recursive_llm.clone(),
                 self.recursive_runner.clone(),
                 self.depth,
+                self.shared_state.clone(),
             )?);
         }
         let repl_env = self
@@ -191,6 +204,7 @@ impl RlmRepl {
         self.repl_env = None;
         self.query = None;
         self.repl_env_logger.clear();
+        self.shared_state.clear();
     }
 
     fn reset_messages_to_system_prompt(&mut self) {
@@ -208,11 +222,15 @@ impl RlmRepl {
 #[derive(Clone)]
 struct RlmRecursiveRunner {
     config: RlmConfig,
+    shared_state: SharedProgramState,
 }
 
 impl RlmRecursiveRunner {
-    fn new(config: RlmConfig) -> Self {
-        Self { config }
+    fn new(config: RlmConfig, shared_state: SharedProgramState) -> Self {
+        Self {
+            config,
+            shared_state,
+        }
     }
 
     fn child_config(&self) -> RlmConfig {
@@ -233,10 +251,8 @@ impl RlmRecursiveRunner {
 #[async_trait::async_trait]
 impl RecursiveRunner for RlmRecursiveRunner {
     async fn completion(&self, query: String, context: ContextInput) -> anyhow::Result<String> {
-        if self.config.depth == 0 {
-            anyhow::bail!("rlm_query disabled at depth 0");
-        }
-        let mut repl = RlmRepl::new(self.child_config())?;
+        let mut repl =
+            RlmRepl::new_with_shared_state(self.child_config(), self.shared_state.clone())?;
         repl.completion(context, Some(&query)).await
     }
 }

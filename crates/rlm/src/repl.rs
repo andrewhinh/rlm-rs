@@ -11,7 +11,7 @@ use rustpython_vm::builtins::{PyBaseException, PyDictRef};
 use rustpython_vm::scope::Scope;
 use rustpython_vm::{Interpreter, InterpreterBuilder};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
@@ -45,6 +45,44 @@ pub struct ReplResult {
 struct RlmQueryPayload {
     query: Option<String>,
     context: Option<Value>,
+}
+
+#[derive(Clone, Default)]
+pub struct SharedProgramState {
+    data: Arc<Mutex<Map<String, Value>>>,
+}
+
+impl SharedProgramState {
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(Map::new())),
+        }
+    }
+
+    pub fn clear(&self) {
+        let mut state = self.data.lock().expect("shared state lock poisoned");
+        state.clear();
+    }
+
+    pub fn snapshot_json_string(&self) -> anyhow::Result<String> {
+        let state = self.data.lock().expect("shared state lock poisoned");
+        serde_json::to_string(&Value::Object(state.clone()))
+            .map_err(|err| anyhow::anyhow!("shared state serialization error: {err}"))
+    }
+
+    pub fn merge_from_json(&self, value: Value, deleted_keys: &[String]) -> anyhow::Result<()> {
+        let next_state = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("shared state must be a JSON object"))?;
+        let mut state = self.data.lock().expect("shared state lock poisoned");
+        for key in deleted_keys {
+            state.remove(key);
+        }
+        for (key, value) in next_state {
+            state.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
 }
 
 const EXECUTION_TIMEOUT_SECS: f64 = 10.0;
@@ -85,6 +123,7 @@ struct ReplCore {
     runtime_handle: Handle,
     recursive_runner: Option<Arc<dyn RecursiveRunner>>,
     recursion_depth: usize,
+    shared_state: SharedProgramState,
     repl_env: Option<ReplEnv>,
 }
 
@@ -96,6 +135,7 @@ pub struct ReplEnv {
     runtime_handle: Handle,
     recursive_runner: Option<Arc<dyn RecursiveRunner>>,
     recursion_depth: usize,
+    shared_state: SharedProgramState,
     execution_lock: Mutex<()>,
 }
 
@@ -105,6 +145,7 @@ impl ReplEnv {
         llm_client: Arc<dyn LlmClient>,
         recursive_runner: Option<Arc<dyn RecursiveRunner>>,
         recursion_depth: usize,
+        shared_state: SharedProgramState,
         setup_code: Option<&str>,
         runtime_handle: Handle,
     ) -> anyhow::Result<Self> {
@@ -128,6 +169,7 @@ impl ReplEnv {
             runtime_handle,
             recursive_runner,
             recursion_depth,
+            shared_state,
             execution_lock: Mutex::new(()),
         };
         env.initialize(context)?;
@@ -142,6 +184,7 @@ impl ReplEnv {
         let runtime_handle = self.runtime_handle.clone();
         let recursive_runner = self.recursive_runner.clone();
         let recursion_depth = self.recursion_depth;
+        let shared_state_json = self.shared_state.snapshot_json_string()?;
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
@@ -161,84 +204,84 @@ impl ReplEnv {
             text_path = Some(path.to_string_lossy().to_string());
         }
 
-        let enter_result = self
-            .interpreter
+        self.interpreter
             .enter(move |vm: &vm::VirtualMachine| -> vm::PyResult<()> {
-            scope
-                .globals
-                .set_item(
+                scope.globals.set_item(
                     "__rlm_temp_dir",
                     vm.ctx.new_str(temp_dir_str.as_str()).into(),
                     vm,
                 )?;
-            let llm_runtime_handle = runtime_handle.clone();
-            let llm_fn = vm.new_function(
-                "__rlm_llm_query",
-                move |prompt: String| -> vm::PyResult<String> {
-                    let messages = parse_llm_prompt(&prompt);
-                    if let Err(err) = validate_subcall_messages(&messages) {
-                        return Ok(format!("Error making LLM query: {err}"));
-                    }
-                    let llm_client = llm_client.clone();
-                    let runtime_handle = llm_runtime_handle.clone();
-                    let response = runtime_handle.block_on(async move {
-                        llm_client
-                            .completion(&messages, None)
-                            .await
-                            .unwrap_or_else(|err| format!("Error making LLM query: {err}"))
-                    });
-                    Ok(response)
-                },
-            );
-            scope
-                .globals
-                .set_item("__rlm_llm_query", llm_fn.into(), vm)?;
-            let recursive_runner_many = recursive_runner.clone();
-            let rlm_runtime_handle = runtime_handle.clone();
-            let rlm_fn = vm.new_function(
-                "__rlm_rlm_query",
-                move |payload_json: String| -> vm::PyResult<String> {
-                    if recursion_depth == 0 || recursive_runner_many.is_none() {
-                        return Ok(
-                            "Error: rlm_query disabled at depth 0; increase depth to enable."
-                                .to_owned(),
-                        );
-                    }
-                    let payloads: Vec<RlmQueryPayload> = match serde_json::from_str(&payload_json)
-                    {
-                        Ok(payloads) => payloads,
-                        Err(err) => {
-                            return Ok(format!("Error parsing rlm_query payloads: {err}"));
+                scope.globals.set_item(
+                    "__rlm_shared_state_json",
+                    vm.ctx.new_str(shared_state_json.as_str()).into(),
+                    vm,
+                )?;
+                let llm_runtime_handle = runtime_handle.clone();
+                let llm_fn = vm.new_function(
+                    "__rlm_llm_query",
+                    move |prompt: String| -> vm::PyResult<String> {
+                        let messages = parse_llm_prompt(&prompt);
+                        if let Err(err) = validate_subcall_messages(&messages) {
+                            return Ok(format!("Error making LLM query: {err}"));
                         }
-                    };
-                    if payloads.is_empty() {
-                        return Ok("[]".to_owned());
-                    }
-                    let runner = recursive_runner_many
-                        .clone()
-                        .expect("recursive runner");
-                    let runtime_handle = rlm_runtime_handle.clone();
-                    let outputs = runtime_handle.block_on(async move {
-                        let mut outputs = Vec::with_capacity(payloads.len());
-                        for payload in payloads {
-                            let query = payload
-                                .query
-                                .unwrap_or_else(|| crate::prompts::DEFAULT_QUERY.to_owned());
-                            let context = context_from_value(payload.context);
-                            let result = runner.completion(query, context).await;
-                            match result {
-                                Ok(result) => outputs.push(result),
-                                Err(err) => outputs.push(format!("Error running rlm_query: {err}")),
+                        let llm_client = llm_client.clone();
+                        let runtime_handle = llm_runtime_handle.clone();
+                        let response = runtime_handle.block_on(async move {
+                            llm_client
+                                .completion(&messages, None)
+                                .await
+                                .unwrap_or_else(|err| format!("Error making LLM query: {err}"))
+                        });
+                        Ok(response)
+                    },
+                );
+                scope
+                    .globals
+                    .set_item("__rlm_llm_query", llm_fn.into(), vm)?;
+                let recursive_runner_many = recursive_runner.clone();
+                let rlm_runtime_handle = runtime_handle.clone();
+                let rlm_fn = vm.new_function(
+                    "__rlm_rlm_query",
+                    move |payload_json: String| -> vm::PyResult<String> {
+                        if recursion_depth == 0 || recursive_runner_many.is_none() {
+                            return Ok(
+                                "Error: rlm_query disabled at depth 0; increase depth to enable."
+                                    .to_owned(),
+                            );
+                        }
+                        let runner = recursive_runner_many.clone().expect("recursive runner");
+                        let payloads: Vec<RlmQueryPayload> = match serde_json::from_str(&payload_json)
+                        {
+                            Ok(payloads) => payloads,
+                            Err(err) => {
+                                return Ok(format!("Error parsing rlm_query payloads: {err}"));
                             }
+                        };
+                        if payloads.is_empty() {
+                            return Ok("[]".to_owned());
                         }
-                        outputs
-                    });
-                    Ok(serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".to_owned()))
-                },
-            );
-            scope
-                .globals
-                .set_item("__rlm_rlm_query", rlm_fn.into(), vm)?;
+                        let runtime_handle = rlm_runtime_handle.clone();
+                        let outputs = runtime_handle.block_on(async move {
+                            let mut outputs = Vec::with_capacity(payloads.len());
+                            for payload in payloads {
+                                let query = payload
+                                    .query
+                                    .unwrap_or_else(|| crate::prompts::DEFAULT_QUERY.to_owned());
+                                let context = context_from_value(payload.context);
+                                let result = runner.completion(query, context).await;
+                                match result {
+                                    Ok(result) => outputs.push(result),
+                                    Err(err) => outputs.push(format!("Error running rlm_query: {err}")),
+                                }
+                            }
+                            outputs
+                        });
+                        Ok(serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".to_owned()))
+                    },
+                );
+                scope
+                    .globals
+                    .set_item("__rlm_rlm_query", rlm_fn.into(), vm)?;
             let init_segments = [
                 (
                     "builtins_ref",
@@ -320,6 +363,31 @@ def __rlm_safe_open(path, *args, _import=__rlm_import_builtin, _open=__rlm_open_
                 ),
                 ("builtins_assign", "__builtins__ = __rlm_safe_builtins\n"),
                 ("locals_init", "__rlm_locals = {}\n"),
+                (
+                    "state_init",
+                    r#"import json
+state = json.loads(__rlm_shared_state_json)
+__rlm_state_deleted_keys = set()
+
+def state_get(key, default=None):
+    return state.get(str(key), default)
+
+def state_set(key, value):
+    key = str(key)
+    if key in __rlm_state_deleted_keys:
+        __rlm_state_deleted_keys.remove(key)
+    state[key] = value
+    return value
+
+def state_del(key):
+    key = str(key)
+    __rlm_state_deleted_keys.add(key)
+    return state.pop(key, None)
+
+def state_keys():
+    return list(state.keys())
+"#,
+                ),
                 (
                     "llm_query",
                     r#"__rlm_json = __rlm_get_builtin('__import__')('json')
@@ -476,11 +544,9 @@ def llm_query(prompts):
                 let code = "with open(__rlm_context_text_path, \"r\") as f:\n    context = f.read()\n";
                 vm.run_string(scope.clone(), code, "<rlm_context_text>".to_owned())?;
             }
-            Ok(())
-        });
-        enter_result.map_err(|err: vm::PyRef<PyBaseException>| {
-            anyhow::anyhow!("python init error: {err:?}")
-        })?;
+                Ok(())
+            })
+            .map_err(|err: vm::PyRef<PyBaseException>| anyhow::anyhow!("python init error: {err:?}"))?;
 
         Ok(())
     }
@@ -490,6 +556,7 @@ def llm_query(prompts):
             .execution_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("repl lock poisoned"))?;
+        self.hydrate_shared_state()?;
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
         let start = Instant::now();
@@ -537,6 +604,7 @@ def llm_query(prompts):
                 anyhow::anyhow!("python exec error: {err:?}")
             })?;
 
+        self.sync_shared_state()?;
         result.execution_time = start.elapsed().as_secs_f64();
         Ok(result)
     }
@@ -565,6 +633,49 @@ def llm_query(prompts):
     pub fn get_cost_summary(&self) -> anyhow::Result<()> {
         anyhow::bail!("Cost tracking is not implemented for the REPL Environment.")
     }
+
+    fn hydrate_shared_state(&self) -> anyhow::Result<()> {
+        let scope = self.scope.clone();
+        let shared_state_json = self.shared_state.snapshot_json_string()?;
+        self.interpreter
+            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<()> {
+                scope.globals.set_item(
+                    "__rlm_shared_state_json",
+                    vm.ctx.new_str(shared_state_json.as_str()).into(),
+                    vm,
+                )?;
+                let hydrate_code = "import json\n__rlm_state_incoming = json.loads(__rlm_shared_state_json)\nstate.clear()\nstate.update(__rlm_state_incoming)\n";
+                vm.run_string(scope.clone(), hydrate_code, "<rlm_state_hydrate>".to_owned())?;
+                Ok(())
+            })
+            .map_err(|err: vm::PyRef<PyBaseException>| {
+                anyhow::anyhow!("shared state hydrate error: {err:?}")
+            })
+    }
+
+    fn sync_shared_state(&self) -> anyhow::Result<()> {
+        let scope = self.scope.clone();
+        let (state_json, deleted_json) = self
+            .interpreter
+            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
+                let sync_code = "import json\n__rlm_state_sync_payload = json.dumps(state)\n__rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\n__rlm_state_deleted_keys.clear()\n";
+                vm.run_string(scope.clone(), sync_code, "<rlm_state_sync>".to_owned())?;
+                let state_json = get_string_from_scope(vm, &scope, "__rlm_state_sync_payload");
+                let deleted_json = get_string_from_scope(vm, &scope, "__rlm_state_deleted_payload");
+                Ok((state_json, deleted_json))
+            })
+            .map_err(|err: vm::PyRef<PyBaseException>| {
+                anyhow::anyhow!(
+                    "shared state sync error (values must be JSON serializable): {err:?}"
+                )
+            })?;
+        let state_value: Value = serde_json::from_str(&state_json)
+            .map_err(|err| anyhow::anyhow!("shared state sync parse error: {err}"))?;
+        let deleted_keys: Vec<String> = serde_json::from_str(&deleted_json)
+            .map_err(|err| anyhow::anyhow!("shared state delete parse error: {err}"))?;
+        self.shared_state
+            .merge_from_json(state_value, &deleted_keys)
+    }
 }
 
 impl ReplCore {
@@ -573,12 +684,14 @@ impl ReplCore {
         runtime_handle: Handle,
         recursive_runner: Option<Arc<dyn RecursiveRunner>>,
         recursion_depth: usize,
+        shared_state: SharedProgramState,
     ) -> Self {
         Self {
             llm_client,
             runtime_handle,
             recursive_runner,
             recursion_depth,
+            shared_state,
             repl_env: None,
         }
     }
@@ -589,6 +702,7 @@ impl ReplCore {
             self.llm_client.clone(),
             self.recursive_runner.clone(),
             self.recursion_depth,
+            self.shared_state.clone(),
             setup_code.as_deref(),
             self.runtime_handle.clone(),
         )?;
@@ -622,6 +736,7 @@ impl ReplHandle {
         llm_client: Arc<dyn LlmClient>,
         recursive_runner: Option<Arc<dyn RecursiveRunner>>,
         recursion_depth: usize,
+        shared_state: SharedProgramState,
     ) -> anyhow::Result<Self> {
         let runtime_handle = Handle::try_current()
             .map_err(|err| anyhow::anyhow!("tokio runtime handle unavailable: {err}"))?;
@@ -635,6 +750,7 @@ impl ReplHandle {
                     runtime_handle,
                     recursive_runner,
                     recursion_depth,
+                    shared_state,
                 );
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
