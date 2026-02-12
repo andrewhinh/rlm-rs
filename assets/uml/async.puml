@@ -1,0 +1,63 @@
+@startuml
+participant "TokioRuntime" as Tokio
+participant "main()" as Main
+participant "RlmRepl" as Rlm
+participant "LlmClient(reqwest-async)" as Llm
+participant "ReplHandle" as Handle
+participant "TokioMpsc+Oneshot" as Chan
+participant "ReplWorkerThread" as Worker
+participant "ReplCore/ReplEnv" as Core
+participant "RustPythonVM" as Py
+participant "OpenAIAPI" as Api
+
+== Startup ==
+Main -> Tokio: start multi-thread runtime
+Main -> Tokio: spawn_blocking(generate_massive_context)
+Tokio --> Main: context ready
+Main -> Rlm: completion(context, query).await
+
+== Root ==
+Rlm -> Llm: completion(messages).await
+Llm -> Api: HTTP /chat/completions (async)
+Api --> Llm: response
+Llm --> Rlm: model output
+
+alt output contains ```repl``` code
+  Rlm -> Handle: execute(code).await
+  Handle -> Chan: send Execute + oneshot responder
+  Chan -> Worker: deliver command (non-blocking to Tokio workers)
+  Worker -> Core: execute(code) (sync)
+  Core -> Py: interpreter.enter + run_string
+  Py --> Core: stdout/stderr/locals
+  Core --> Worker: ReplResult
+  Worker --> Chan: oneshot send result
+  Chan --> Handle: await result
+  Handle --> Rlm: ReplResult
+end
+
+== FINAL_VAR path ==
+Rlm -> Handle: get_variable(name).await
+Handle -> Chan: send GetVariable + oneshot
+Chan -> Worker: deliver command
+Worker -> Core: get_variable(name)
+Core -> Py: interpreter.enter
+Py --> Core: value
+Core --> Worker: Option<String>
+Worker --> Chan: oneshot send value
+Chan --> Handle: await value
+Handle --> Rlm: variable value
+
+== Sub-LLM call from Python (i.e., llm_query) ==
+Py -> Core: __rlm_llm_query(payload)
+Core -> Tokio: runtime_handle.block_on(async llm completion)
+Tokio -> Llm: completion(messages).await
+Llm -> Api: HTTP /chat/completions (async)
+Api --> Llm: response
+Llm --> Tokio: text
+Tokio --> Core: text
+Core --> Py: return llm_query output
+
+== Result ==
+Rlm --> Main: final answer
+
+@enduml

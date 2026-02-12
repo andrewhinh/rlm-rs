@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use async_trait::async_trait;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,8 +44,9 @@ pub enum LlmError {
     InvalidResponse,
 }
 
+#[async_trait]
 pub trait LlmClient: Send + Sync {
-    fn completion(
+    async fn completion(
         &self,
         messages: &[Message],
         max_completion_tokens: Option<u32>,
@@ -96,8 +98,9 @@ struct ChatMessage {
     content: Option<String>,
 }
 
+#[async_trait]
 impl LlmClient for LlmClientImpl {
-    fn completion(
+    async fn completion(
         &self,
         messages: &[Message],
         max_completion_tokens: Option<u32>,
@@ -114,10 +117,11 @@ impl LlmClient for LlmClientImpl {
             .post(url)
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send()?
+            .send()
+            .await?
             .error_for_status()?;
 
-        let parsed: ChatResponse = response.json()?;
+        let parsed: ChatResponse = response.json().await?;
         let content = parsed
             .choices
             .first()
