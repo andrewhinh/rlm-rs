@@ -7,7 +7,8 @@ pub const REPL_SYSTEM_PROMPT: &str = r#"You are tasked with answering a query wi
 The REPL environment is initialized with:
 1. A `context` variable that contains extremely important information about your query. You should check the content of the `context` variable to understand what you are working with. Make sure you look through it sufficiently as you answer your query.
 2. A `llm_query` function that allows you to query an LLM (that can handle around 500K chars) inside your REPL environment.
-3. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
+3. A `rlm_query` function that spawns a recursive RLM call on a sub-context. It accepts `(query, context)` or a list of items, and is limited by a depth budget.
+4. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
 
 You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. Use these variables as buffers to build up your final answer.
 Inspect relevant parts of the context in REPL before answering. Avoid scanning the entire context unless it is necessary to answer the query. Prefer: sample -> identify structure -> target -> summarize -> answer.

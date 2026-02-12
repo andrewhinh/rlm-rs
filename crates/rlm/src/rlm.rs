@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::llm::{LlmClient, LlmClientImpl, Message};
 use crate::logger::{Logger, ReplEnvLogger};
 use crate::prompts::{DEFAULT_QUERY, REPL_SYSTEM_PROMPT, build_system_prompt, next_action_prompt};
-use crate::repl::{ReplHandle, ReplResult};
+use crate::repl::{RecursiveRunner, ReplHandle, ReplResult};
 use crate::utils::{
     ContextInput, check_for_final_answer, convert_context_for_repl, find_code_blocks,
     process_code_execution,
@@ -24,7 +24,6 @@ pub struct RlmConfig {
 pub struct RlmRepl {
     llm: Arc<dyn LlmClient>,
     recursive_llm: Arc<dyn LlmClient>,
-    #[allow(dead_code)]
     depth: usize,
     max_iterations: usize,
     logger: Logger,
@@ -33,6 +32,7 @@ pub struct RlmRepl {
     repl_env: Option<ReplHandle>,
     query: Option<String>,
     disable_recursive: bool,
+    recursive_runner: Option<Arc<dyn RecursiveRunner>>,
 }
 
 impl RlmRepl {
@@ -47,6 +47,11 @@ impl RlmRepl {
             config.api_key.clone(),
             config.base_url.clone(),
         )?;
+        let recursive_runner: Option<Arc<dyn RecursiveRunner>> = if config.depth > 0 {
+            Some(Arc::new(RlmRecursiveRunner::new(config.clone())))
+        } else {
+            None
+        };
         Ok(Self {
             llm,
             recursive_llm,
@@ -58,6 +63,7 @@ impl RlmRepl {
             repl_env: None,
             query: None,
             disable_recursive: config.disable_recursive,
+            recursive_runner,
         })
     }
 
@@ -75,7 +81,11 @@ impl RlmRepl {
 
         let context_data = convert_context_for_repl(context.into());
         if self.repl_env.is_none() {
-            self.repl_env = Some(ReplHandle::new(self.recursive_llm.clone())?);
+            self.repl_env = Some(ReplHandle::new(
+                self.recursive_llm.clone(),
+                self.recursive_runner.clone(),
+                self.depth,
+            )?);
         }
         let repl_env = self
             .repl_env
@@ -192,6 +202,42 @@ impl RlmRepl {
             return;
         }
         self.messages = build_system_prompt();
+    }
+}
+
+#[derive(Clone)]
+struct RlmRecursiveRunner {
+    config: RlmConfig,
+}
+
+impl RlmRecursiveRunner {
+    fn new(config: RlmConfig) -> Self {
+        Self { config }
+    }
+
+    fn child_config(&self) -> RlmConfig {
+        let depth = self.config.depth.saturating_sub(1);
+        RlmConfig {
+            api_key: self.config.api_key.clone(),
+            base_url: self.config.base_url.clone(),
+            model: self.config.recursive_model.clone(),
+            recursive_model: self.config.recursive_model.clone(),
+            max_iterations: self.config.max_iterations,
+            depth,
+            enable_logging: self.config.enable_logging,
+            disable_recursive: self.config.disable_recursive,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RecursiveRunner for RlmRecursiveRunner {
+    async fn completion(&self, query: String, context: ContextInput) -> anyhow::Result<String> {
+        if self.config.depth == 0 {
+            anyhow::bail!("rlm_query disabled at depth 0");
+        }
+        let mut repl = RlmRepl::new(self.child_config())?;
+        repl.completion(context, Some(&query)).await
     }
 }
 

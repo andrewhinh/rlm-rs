@@ -3,18 +3,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use rustpython_pylib;
 use rustpython_stdlib;
 use rustpython_vm as vm;
 use rustpython_vm::builtins::{PyBaseException, PyDictRef};
 use rustpython_vm::scope::Scope;
 use rustpython_vm::{Interpreter, InterpreterBuilder};
+use serde::Deserialize;
+use serde_json::Value;
 use tempfile::TempDir;
-
-use crate::llm::{LlmClient, Message};
-use crate::utils::ContextData;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::llm::{LlmClient, Message};
+use crate::utils::{ContextData, ContextInput, context_from_value};
+
+#[async_trait]
+pub trait RecursiveRunner: Send + Sync {
+    async fn completion(&self, query: String, context: ContextInput) -> anyhow::Result<String>;
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalValue {
@@ -31,6 +39,12 @@ pub struct ReplResult {
     pub locals: Vec<LocalValue>,
     pub locals_map: Vec<(String, String)>,
     pub execution_time: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RlmQueryPayload {
+    query: Option<String>,
+    context: Option<Value>,
 }
 
 const EXECUTION_TIMEOUT_SECS: f64 = 10.0;
@@ -69,6 +83,8 @@ pub struct ReplHandle {
 struct ReplCore {
     llm_client: Arc<dyn LlmClient>,
     runtime_handle: Handle,
+    recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+    recursion_depth: usize,
     repl_env: Option<ReplEnv>,
 }
 
@@ -78,6 +94,8 @@ pub struct ReplEnv {
     temp_dir: TempDir,
     llm_client: Arc<dyn LlmClient>,
     runtime_handle: Handle,
+    recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+    recursion_depth: usize,
     execution_lock: Mutex<()>,
 }
 
@@ -85,6 +103,8 @@ impl ReplEnv {
     pub fn new(
         context: ContextData,
         llm_client: Arc<dyn LlmClient>,
+        recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+        recursion_depth: usize,
         setup_code: Option<&str>,
         runtime_handle: Handle,
     ) -> anyhow::Result<Self> {
@@ -106,6 +126,8 @@ impl ReplEnv {
             temp_dir,
             llm_client,
             runtime_handle,
+            recursive_runner,
+            recursion_depth,
             execution_lock: Mutex::new(()),
         };
         env.initialize(context)?;
@@ -118,6 +140,8 @@ impl ReplEnv {
     fn initialize(&mut self, context: ContextData) -> anyhow::Result<()> {
         let llm_client = self.llm_client.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let recursive_runner = self.recursive_runner.clone();
+        let recursion_depth = self.recursion_depth;
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
@@ -147,6 +171,7 @@ impl ReplEnv {
                     vm.ctx.new_str(temp_dir_str.as_str()).into(),
                     vm,
                 )?;
+            let llm_runtime_handle = runtime_handle.clone();
             let llm_fn = vm.new_function(
                 "__rlm_llm_query",
                 move |prompt: String| -> vm::PyResult<String> {
@@ -155,7 +180,7 @@ impl ReplEnv {
                         return Ok(format!("Error making LLM query: {err}"));
                     }
                     let llm_client = llm_client.clone();
-                    let runtime_handle = runtime_handle.clone();
+                    let runtime_handle = llm_runtime_handle.clone();
                     let response = runtime_handle.block_on(async move {
                         llm_client
                             .completion(&messages, None)
@@ -168,6 +193,52 @@ impl ReplEnv {
             scope
                 .globals
                 .set_item("__rlm_llm_query", llm_fn.into(), vm)?;
+            let recursive_runner_many = recursive_runner.clone();
+            let rlm_runtime_handle = runtime_handle.clone();
+            let rlm_fn = vm.new_function(
+                "__rlm_rlm_query",
+                move |payload_json: String| -> vm::PyResult<String> {
+                    if recursion_depth == 0 || recursive_runner_many.is_none() {
+                        return Ok(
+                            "Error: rlm_query disabled at depth 0; increase depth to enable."
+                                .to_owned(),
+                        );
+                    }
+                    let payloads: Vec<RlmQueryPayload> = match serde_json::from_str(&payload_json)
+                    {
+                        Ok(payloads) => payloads,
+                        Err(err) => {
+                            return Ok(format!("Error parsing rlm_query payloads: {err}"));
+                        }
+                    };
+                    if payloads.is_empty() {
+                        return Ok("[]".to_owned());
+                    }
+                    let runner = recursive_runner_many
+                        .clone()
+                        .expect("recursive runner");
+                    let runtime_handle = rlm_runtime_handle.clone();
+                    let outputs = runtime_handle.block_on(async move {
+                        let mut outputs = Vec::with_capacity(payloads.len());
+                        for payload in payloads {
+                            let query = payload
+                                .query
+                                .unwrap_or_else(|| crate::prompts::DEFAULT_QUERY.to_owned());
+                            let context = context_from_value(payload.context);
+                            let result = runner.completion(query, context).await;
+                            match result {
+                                Ok(result) => outputs.push(result),
+                                Err(err) => outputs.push(format!("Error running rlm_query: {err}")),
+                            }
+                        }
+                        outputs
+                    });
+                    Ok(serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".to_owned()))
+                },
+            );
+            scope
+                .globals
+                .set_item("__rlm_rlm_query", rlm_fn.into(), vm)?;
             let init_segments = [
                 (
                     "builtins_ref",
@@ -270,6 +341,43 @@ def llm_query(prompts):
     finally:
         if __rlm_settrace is not None:
             __rlm_settrace(prev_trace)
+"#,
+                ),
+                (
+                    "rlm_query",
+                    r#"def rlm_query(query, context=None):
+    if isinstance(query, list) and context is None:
+        items = query
+        unwrap_single = False
+    else:
+        items = [query]
+        unwrap_single = True
+    __rlm_json = __rlm_get_builtin('__import__')('json')
+    __rlm_globals = __rlm_globals_builtin()
+    payload_items = []
+    for item in items:
+        if isinstance(item, dict):
+            q = item.get("query")
+            ctx = item.get("context")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            q, ctx = item
+        else:
+            q = item
+            ctx = context
+        if ctx is None:
+            ctx = context
+        if ctx is None:
+            ctx = __rlm_globals.get("context")
+        payload_items.append({"query": str(q), "context": ctx})
+    payload = __rlm_json.dumps(payload_items, default=str)
+    response = __rlm_rlm_query(payload)
+    try:
+        parsed = __rlm_json.loads(response)
+    except Exception:
+        return response
+    if unwrap_single and isinstance(parsed, list) and len(parsed) == 1:
+        return parsed[0]
+    return parsed
 "#,
                 ),
                 (
@@ -460,10 +568,17 @@ def llm_query(prompts):
 }
 
 impl ReplCore {
-    fn new(llm_client: Arc<dyn LlmClient>, runtime_handle: Handle) -> Self {
+    fn new(
+        llm_client: Arc<dyn LlmClient>,
+        runtime_handle: Handle,
+        recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+        recursion_depth: usize,
+    ) -> Self {
         Self {
             llm_client,
             runtime_handle,
+            recursive_runner,
+            recursion_depth,
             repl_env: None,
         }
     }
@@ -472,6 +587,8 @@ impl ReplCore {
         let env = ReplEnv::new(
             context,
             self.llm_client.clone(),
+            self.recursive_runner.clone(),
+            self.recursion_depth,
             setup_code.as_deref(),
             self.runtime_handle.clone(),
         )?;
@@ -501,7 +618,11 @@ impl ReplCore {
 }
 
 impl ReplHandle {
-    pub fn new(llm_client: Arc<dyn LlmClient>) -> anyhow::Result<Self> {
+    pub fn new(
+        llm_client: Arc<dyn LlmClient>,
+        recursive_runner: Option<Arc<dyn RecursiveRunner>>,
+        recursion_depth: usize,
+    ) -> anyhow::Result<Self> {
         let runtime_handle = Handle::try_current()
             .map_err(|err| anyhow::anyhow!("tokio runtime handle unavailable: {err}"))?;
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -509,7 +630,12 @@ impl ReplHandle {
         thread::Builder::new()
             .name("rlm-repl-worker".to_owned())
             .spawn(move || {
-                let mut core = ReplCore::new(llm_client, runtime_handle);
+                let mut core = ReplCore::new(
+                    llm_client,
+                    runtime_handle,
+                    recursive_runner,
+                    recursion_depth,
+                );
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
                         ReplCommand::Init {
