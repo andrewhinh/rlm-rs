@@ -22,6 +22,7 @@ app:
 
 goose:
 	@if [ -z "$(HOST)" ]; then echo "usage: make goose HOST=<host>"; exit 1; fi
+	mkdir -p logs
 	cargo run -p app --bin goose -- \
 		--host "$(HOST)" \
 		--timeout 86400 \

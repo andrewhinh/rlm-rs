@@ -67,11 +67,19 @@ make goose HOST=<host>
 - [x] unblock event loop
 - [x] add support for depth > 1
 - [x] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
-- [ ] add per-session REPL sandboxing with gVisor
+- [x] add per-session REPL sandboxing with gVisor
 
 ## Details
 
-This diagram shows the async runtime flow:
+### Sandboxing
+
+![arch](./assets/arch.png)
+
+In `crates/app/src/main.rs`, the session worker stores session state in a `HashMap<String, SessionSandbox>` with LRU eviction and maps each `session_id` to one sandbox handle.
+New or reset sessions acquire a fresh runsc-backed container from `SandboxPool`, while existing sessions reuse their current handle.
+Inside each container, `crates/app/src/bin/sandbox_worker.rs` drives a single `RlmRepl`, and `crates/rlm/src/repl.rs` keeps `SharedProgramState` local to that session.
+
+### Async Runtime
 
 ![async](./assets/async.png)
 

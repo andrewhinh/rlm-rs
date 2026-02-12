@@ -1,0 +1,43 @@
+@startuml
+
+actor Client
+cloud "OpenAI API" as OpenAI
+
+node "app" as App {
+  component "/v1/chat/completions" as Endpoint
+  queue "tokio::mpsc\nSessionRequest" as Queue
+  component "SessionWorkerThread" as SessionWorker
+  database "sessions: HashMap<session_id, SessionSandbox>\nLRU: VecDeque<session_id>" as SessionTable
+  component "SandboxPool" as Pool
+}
+
+node "docker" as DockerHost {
+  node "container a" as ContainerA {
+    component "sandbox_worker" as WorkerA
+    component "RlmRepl + RustPython VM" as ReplA
+    database "SharedProgramState\n(state dict)" as StateA
+  }
+  node "container b" as ContainerB {
+    component "sandbox_worker" as WorkerB
+    component "RlmRepl + RustPython VM" as ReplB
+    database "SharedProgramState\n(state dict)" as StateB
+  }
+}
+
+Client --> Endpoint : POST + x-rlm-session-id / rlm_session cookie
+Endpoint --> Queue : send SessionRequest
+Queue --> SessionWorker : blocking_recv()
+SessionWorker --> SessionTable : lookup session_id
+SessionWorker --> Pool : acquire() when new/reset/evicted
+Pool --> DockerHost : docker run --runtime=runsc
+
+SessionWorker --> WorkerA : run(request) for session A
+SessionWorker --> WorkerB : run(request) for session B
+WorkerA --> ReplA : stateful REPL execution
+WorkerB --> ReplB : stateful REPL execution
+ReplA --> StateA : state_get/state_set/state_del
+ReplB --> StateB : state_get/state_set/state_del
+ReplA --> OpenAI : async chat/completions
+ReplB --> OpenAI : async chat/completions
+
+@enduml

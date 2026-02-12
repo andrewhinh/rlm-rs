@@ -81,6 +81,8 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +112,7 @@ impl LlmClient for LlmClientImpl {
             model: self.model.clone(),
             messages: messages.to_vec(),
             max_completion_tokens,
+            max_tokens: max_completion_tokens,
         };
 
         let response = self
