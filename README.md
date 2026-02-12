@@ -64,10 +64,20 @@ make goose HOST=<host>
 ## Roadmap
 
 - [x] port rlm-minimal to Rust and RustPython
-- [ ] unblock event loop
+- [x] unblock event loop
 - [ ] add support for depth > 1
 - [ ] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
 - [ ] add per-session REPL sandboxing with gVisor
+
+## Details
+
+This diagram shows the async runtime flow:
+
+![async](./assets/async.png)
+
+When the model emits REPL code, the Tokio loop dispatches `Execute` and `GetVariable` commands through `ReplHandle` using the `mpsc` and `oneshot` channels to a dedicated REPL worker thread, which prevents RustPython `interpreter.enter` work from blocking Tokio worker threads.
+
+This approach is better than 1) running RustPython directly on Tokio workers, which reduces concurrency under load, and 2) spawning a fresh thread per REPL call, which adds scheduling overhead and complicates state reuse. Inside Python, `llm_query(...)` returns to async model calls through the captured runtime handle, while startup context generation is offloaded with `spawn_blocking`.
 
 ## Credit
 

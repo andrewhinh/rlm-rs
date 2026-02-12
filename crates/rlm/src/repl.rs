@@ -1,5 +1,6 @@
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use rustpython_pylib;
@@ -12,6 +13,8 @@ use tempfile::TempDir;
 
 use crate::llm::{LlmClient, Message};
 use crate::utils::ContextData;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Debug)]
 pub struct LocalValue {
@@ -31,12 +34,50 @@ pub struct ReplResult {
 }
 
 const EXECUTION_TIMEOUT_SECS: f64 = 10.0;
+const MAX_SUBCALL_TOTAL_TOKENS_APPROX: usize = 120_000;
+const MAX_SUBCALL_MESSAGE_TOKENS_APPROX: usize = 105_000;
+const MAX_SUBCALL_TOTAL_CHARS: usize = 480_000;
+const MAX_SUBCALL_MESSAGE_CHARS: usize = 420_000;
+
+enum ReplCommand {
+    Init {
+        context: ContextData,
+        setup_code: Option<String>,
+        response: oneshot::Sender<anyhow::Result<()>>,
+    },
+    Execute {
+        code: String,
+        response: oneshot::Sender<anyhow::Result<ReplResult>>,
+    },
+    GetVariable {
+        name: String,
+        response: oneshot::Sender<anyhow::Result<Option<String>>>,
+    },
+    Reset {
+        response: oneshot::Sender<anyhow::Result<()>>,
+    },
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
+}
+
+#[derive(Clone)]
+pub struct ReplHandle {
+    sender: mpsc::UnboundedSender<ReplCommand>,
+}
+
+struct ReplCore {
+    llm_client: Arc<dyn LlmClient>,
+    runtime_handle: Handle,
+    repl_env: Option<ReplEnv>,
+}
 
 pub struct ReplEnv {
     interpreter: Interpreter,
     scope: Scope,
     temp_dir: TempDir,
     llm_client: Arc<dyn LlmClient>,
+    runtime_handle: Handle,
     execution_lock: Mutex<()>,
 }
 
@@ -45,6 +86,7 @@ impl ReplEnv {
         context: ContextData,
         llm_client: Arc<dyn LlmClient>,
         setup_code: Option<&str>,
+        runtime_handle: Handle,
     ) -> anyhow::Result<Self> {
         let builder = InterpreterBuilder::new();
         let interpreter = init_stdlib(builder).interpreter();
@@ -63,6 +105,7 @@ impl ReplEnv {
             scope,
             temp_dir,
             llm_client,
+            runtime_handle,
             execution_lock: Mutex::new(()),
         };
         env.initialize(context)?;
@@ -74,6 +117,7 @@ impl ReplEnv {
 
     fn initialize(&mut self, context: ContextData) -> anyhow::Result<()> {
         let llm_client = self.llm_client.clone();
+        let runtime_handle = self.runtime_handle.clone();
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
@@ -107,11 +151,19 @@ impl ReplEnv {
                 "__rlm_llm_query",
                 move |prompt: String| -> vm::PyResult<String> {
                     let messages = parse_llm_prompt(&prompt);
-                    let response = llm_client
-                        .completion(&messages, None)
-                        .unwrap_or_else(|err| format!("Error making LLM query: {err}"));
+                    if let Err(err) = validate_subcall_messages(&messages) {
+                        return Ok(format!("Error making LLM query: {err}"));
+                    }
+                    let llm_client = llm_client.clone();
+                    let runtime_handle = runtime_handle.clone();
+                    let response = runtime_handle.block_on(async move {
+                        llm_client
+                            .completion(&messages, None)
+                            .await
+                            .unwrap_or_else(|err| format!("Error making LLM query: {err}"))
+                    });
                     Ok(response)
-                }
+                },
             );
             scope
                 .globals
@@ -199,13 +251,25 @@ def __rlm_safe_open(path, *args, _import=__rlm_import_builtin, _open=__rlm_open_
                 ("locals_init", "__rlm_locals = {}\n"),
                 (
                     "llm_query",
-                    r#"def llm_query(prompts):
-    __rlm_json = __rlm_get_builtin('__import__')('json')
+                    r#"__rlm_json = __rlm_get_builtin('__import__')('json')
+__rlm_sys = __rlm_get_builtin('__import__')('sys')
+
+def llm_query(prompts):
     if isinstance(prompts, list):
         payload = __rlm_json.dumps(prompts, default=str)
     else:
         payload = __rlm_json.dumps([prompts], default=str)
-    return __rlm_llm_query(payload)
+    __rlm_gettrace = getattr(__rlm_sys, 'gettrace', None)
+    __rlm_settrace = getattr(__rlm_sys, 'settrace', None)
+    prev_trace = None
+    if __rlm_settrace is not None:
+        prev_trace = __rlm_gettrace() if __rlm_gettrace is not None else None
+        __rlm_settrace(None)
+    try:
+        return __rlm_llm_query(payload)
+    finally:
+        if __rlm_settrace is not None:
+            __rlm_settrace(prev_trace)
 "#,
                 ),
                 (
@@ -395,6 +459,157 @@ def __rlm_safe_open(path, *args, _import=__rlm_import_builtin, _open=__rlm_open_
     }
 }
 
+impl ReplCore {
+    fn new(llm_client: Arc<dyn LlmClient>, runtime_handle: Handle) -> Self {
+        Self {
+            llm_client,
+            runtime_handle,
+            repl_env: None,
+        }
+    }
+
+    fn init(&mut self, context: ContextData, setup_code: Option<String>) -> anyhow::Result<()> {
+        let env = ReplEnv::new(
+            context,
+            self.llm_client.clone(),
+            setup_code.as_deref(),
+            self.runtime_handle.clone(),
+        )?;
+        self.repl_env = Some(env);
+        Ok(())
+    }
+
+    fn execute(&mut self, code: String) -> anyhow::Result<ReplResult> {
+        let repl_env = self
+            .repl_env
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
+        repl_env.execute(&code)
+    }
+
+    fn get_variable(&self, name: String) -> anyhow::Result<Option<String>> {
+        let repl_env = self
+            .repl_env
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
+        repl_env.get_variable(&name)
+    }
+
+    fn reset(&mut self) {
+        self.repl_env = None;
+    }
+}
+
+impl ReplHandle {
+    pub fn new(llm_client: Arc<dyn LlmClient>) -> anyhow::Result<Self> {
+        let runtime_handle = Handle::try_current()
+            .map_err(|err| anyhow::anyhow!("tokio runtime handle unavailable: {err}"))?;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        thread::Builder::new()
+            .name("rlm-repl-worker".to_owned())
+            .spawn(move || {
+                let mut core = ReplCore::new(llm_client, runtime_handle);
+                while let Some(command) = receiver.blocking_recv() {
+                    match command {
+                        ReplCommand::Init {
+                            context,
+                            setup_code,
+                            response,
+                        } => {
+                            let _ = response.send(core.init(context, setup_code));
+                        }
+                        ReplCommand::Execute { code, response } => {
+                            let _ = response.send(core.execute(code));
+                        }
+                        ReplCommand::GetVariable { name, response } => {
+                            let _ = response.send(core.get_variable(name));
+                        }
+                        ReplCommand::Reset { response } => {
+                            core.reset();
+                            let _ = response.send(Ok(()));
+                        }
+                        ReplCommand::Shutdown { response } => {
+                            let _ = response.send(());
+                            break;
+                        }
+                    }
+                }
+            })?;
+
+        Ok(Self { sender })
+    }
+
+    pub async fn init(
+        &self,
+        context: ContextData,
+        setup_code: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::Init {
+                context,
+                setup_code,
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send init command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped init response"))?
+    }
+
+    pub async fn execute(&self, code: String) -> anyhow::Result<ReplResult> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::Execute {
+                code,
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send execute command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped execute response"))?
+    }
+
+    pub async fn get_variable(&self, name: String) -> anyhow::Result<Option<String>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::GetVariable {
+                name,
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send get_variable command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped get_variable response"))?
+    }
+
+    pub async fn reset(&self) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::Reset {
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send reset command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped reset response"))?
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::Shutdown {
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send shutdown command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped shutdown response"))?;
+        Ok(())
+    }
+}
+
 fn init_stdlib(builder: InterpreterBuilder) -> InterpreterBuilder {
     let defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
     builder
@@ -497,6 +712,46 @@ fn parse_llm_prompt(prompt: &str) -> Vec<Message> {
         Ok(value) => messages_from_json(value).unwrap_or_else(|| vec![Message::user(prompt)]),
         Err(_) => vec![Message::user(prompt)],
     }
+}
+
+fn validate_subcall_messages(messages: &[Message]) -> Result<(), String> {
+    let total_chars: usize = messages.iter().map(|msg| msg.content.len()).sum();
+    let total_tokens_approx = estimate_tokens(total_chars);
+    if total_chars > MAX_SUBCALL_TOTAL_CHARS {
+        return Err(format!(
+            "sub-query too large ({total_chars} chars > {MAX_SUBCALL_TOTAL_CHARS}). Chunk the context before calling llm_query."
+        ));
+    }
+    if total_tokens_approx > MAX_SUBCALL_TOTAL_TOKENS_APPROX {
+        return Err(format!(
+            "sub-query too large (~{total_tokens_approx} tokens > {MAX_SUBCALL_TOTAL_TOKENS_APPROX}). Chunk the context before calling llm_query."
+        ));
+    }
+    if let Some(oversized) = messages
+        .iter()
+        .map(|msg| msg.content.len())
+        .max()
+        .filter(|len| *len > MAX_SUBCALL_MESSAGE_CHARS)
+    {
+        return Err(format!(
+            "single sub-query message too large ({oversized} chars > {MAX_SUBCALL_MESSAGE_CHARS}). Chunk the context before calling llm_query."
+        ));
+    }
+    if let Some(oversized_tokens) = messages
+        .iter()
+        .map(|msg| estimate_tokens(msg.content.len()))
+        .max()
+        .filter(|tokens| *tokens > MAX_SUBCALL_MESSAGE_TOKENS_APPROX)
+    {
+        return Err(format!(
+            "single sub-query message too large (~{oversized_tokens} tokens > {MAX_SUBCALL_MESSAGE_TOKENS_APPROX}). Chunk the context before calling llm_query."
+        ));
+    }
+    Ok(())
+}
+
+fn estimate_tokens(char_count: usize) -> usize {
+    char_count.div_ceil(4)
 }
 
 fn messages_from_json(value: serde_json::Value) -> Option<Vec<Message>> {

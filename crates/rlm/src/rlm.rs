@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::llm::{LlmClient, LlmClientImpl, Message};
 use crate::logger::{Logger, ReplEnvLogger};
 use crate::prompts::{DEFAULT_QUERY, REPL_SYSTEM_PROMPT, build_system_prompt, next_action_prompt};
-use crate::repl::{ReplEnv, ReplResult};
+use crate::repl::{ReplHandle, ReplResult};
 use crate::utils::{
     ContextInput, check_for_final_answer, convert_context_for_repl, find_code_blocks,
     process_code_execution,
@@ -30,7 +30,7 @@ pub struct RlmRepl {
     logger: Logger,
     repl_env_logger: ReplEnvLogger,
     messages: Vec<Message>,
-    repl_env: Option<ReplEnv>,
+    repl_env: Option<ReplHandle>,
     query: Option<String>,
     disable_recursive: bool,
 }
@@ -61,7 +61,7 @@ impl RlmRepl {
         })
     }
 
-    pub fn setup_context(
+    pub async fn setup_context(
         &mut self,
         context: impl Into<ContextInput>,
         query: Option<&str>,
@@ -74,30 +74,36 @@ impl RlmRepl {
         self.logger.log_initial_messages(&self.messages);
 
         let context_data = convert_context_for_repl(context.into());
-        self.repl_env = Some(ReplEnv::new(
-            context_data,
-            self.recursive_llm.clone(),
-            None,
-        )?);
+        if self.repl_env.is_none() {
+            self.repl_env = Some(ReplHandle::new(self.recursive_llm.clone())?);
+        }
+        let repl_env = self
+            .repl_env
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
+        repl_env.init(context_data, None).await?;
 
         Ok(self.messages.clone())
     }
 
-    pub fn completion(
+    pub async fn completion(
         &mut self,
         context: impl Into<ContextInput>,
         query: Option<&str>,
     ) -> anyhow::Result<String> {
-        self.setup_context(context, query)?;
+        self.setup_context(context, query).await?;
 
         let query = self
             .query
             .clone()
             .unwrap_or_else(|| DEFAULT_QUERY.to_owned());
-        self.run_completion_loop(&query)
+        self.run_completion_loop(&query).await
     }
 
-    pub fn completion_with_existing(&mut self, query: Option<&str>) -> anyhow::Result<String> {
+    pub async fn completion_with_existing(
+        &mut self,
+        query: Option<&str>,
+    ) -> anyhow::Result<String> {
         if self.repl_env.is_none() {
             anyhow::bail!("repl env not initialized");
         }
@@ -106,28 +112,29 @@ impl RlmRepl {
         self.logger.log_query_start(&query);
         self.reset_messages_to_system_prompt();
         self.logger.log_initial_messages(&self.messages);
-        self.run_completion_loop(&query)
+        self.run_completion_loop(&query).await
     }
 
-    pub fn execute_code(&mut self, code: &str) -> anyhow::Result<ReplResult> {
+    pub async fn execute_code(&self, code: &str) -> anyhow::Result<ReplResult> {
         let repl_env = self
             .repl_env
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
-        repl_env.execute(code)
+        repl_env.execute(code.to_owned()).await
     }
 
-    fn run_completion_loop(&mut self, query: &str) -> anyhow::Result<String> {
+    async fn run_completion_loop(&mut self, query: &str) -> anyhow::Result<String> {
         let repl_env = self
             .repl_env
-            .as_mut()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
 
         for iteration in 0..self.max_iterations {
             let prompt = next_action_prompt(query, iteration, false);
             self.messages.push(prompt);
 
-            let response = self.llm.completion(&self.messages, None)?;
+            let response = self.llm.completion(&self.messages, None).await?;
             let _ = self.messages.pop();
             let code_blocks = find_code_blocks(&response);
             self.logger
@@ -137,18 +144,21 @@ impl RlmRepl {
                 process_code_execution(
                     &response,
                     &mut self.messages,
-                    repl_env,
+                    &repl_env,
                     &mut self.repl_env_logger,
                     &self.logger,
                     self.disable_recursive,
-                );
+                )
+                .await;
             } else {
                 self.messages.push(Message::assistant(format!(
                     "You responded with:\n{response}"
                 )));
             }
 
-            if let Some(final_answer) = check_for_final_answer(&response, repl_env, &self.logger) {
+            if let Some(final_answer) =
+                check_for_final_answer(&response, &repl_env, &self.logger).await
+            {
                 self.logger.log_final_response(&final_answer);
                 return Ok(final_answer);
             }
@@ -157,7 +167,7 @@ impl RlmRepl {
         println!("No final answer found in any iteration");
         let final_prompt = next_action_prompt(query, self.max_iterations, true);
         self.messages.push(final_prompt);
-        let final_answer = self.llm.completion(&self.messages, None)?;
+        let final_answer = self.llm.completion(&self.messages, None).await?;
         self.logger.log_final_response(&final_answer);
         Ok(final_answer)
     }

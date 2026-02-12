@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::llm::Message;
 use crate::logger::{Logger, ReplEnvLogger};
-use crate::repl::{ReplEnv, ReplResult};
+use crate::repl::{ReplHandle, ReplResult};
 
 #[derive(Clone, Debug)]
 pub enum ContextInput {
@@ -261,13 +261,13 @@ fn escape_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-pub fn execute_code(
-    repl_env: &mut ReplEnv,
+pub async fn execute_code(
+    repl_env: &ReplHandle,
     code: &str,
     repl_env_logger: &mut ReplEnvLogger,
     logger: &Logger,
 ) -> String {
-    match repl_env.execute(code) {
+    match repl_env.execute(code.to_owned()).await {
         Ok(result) => {
             let output = format_execution_result(&result);
             repl_env_logger.log_execution(
@@ -285,17 +285,17 @@ pub fn execute_code(
     }
 }
 
-pub fn process_code_execution(
+pub async fn process_code_execution(
     response: &str,
     messages: &mut Vec<Message>,
-    repl_env: &mut ReplEnv,
+    repl_env: &ReplHandle,
     repl_env_logger: &mut ReplEnvLogger,
     logger: &Logger,
     disable_recursive: bool,
 ) {
     let code_blocks = find_code_blocks(response);
     for code in code_blocks {
-        let execution_result = execute_code(repl_env, &code, repl_env_logger, logger);
+        let execution_result = execute_code(repl_env, &code, repl_env_logger, logger).await;
         let max_len = if disable_recursive {
             usize::MAX
         } else {
@@ -305,9 +305,9 @@ pub fn process_code_execution(
     }
 }
 
-pub fn check_for_final_answer(
+pub async fn check_for_final_answer(
     response: &str,
-    repl_env: &ReplEnv,
+    repl_env: &ReplHandle,
     logger: &Logger,
 ) -> Option<String> {
     let (kind, content) = find_final_answer(response)?;
@@ -320,7 +320,7 @@ pub fn check_for_final_answer(
                 .trim_matches('\'')
                 .trim_matches('\n')
                 .trim_matches('\r');
-            match repl_env.get_variable(variable_name) {
+            match repl_env.get_variable(variable_name.to_owned()).await {
                 Ok(Some(value)) => Some(value),
                 Ok(None) => {
                     let msg = format!("Variable '{}' not found in REPL environment", variable_name);
