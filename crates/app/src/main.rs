@@ -1,12 +1,13 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app::launcher::build_launcher;
-use app::pool::SandboxPool;
-use app::protocol::SandboxRunRequest;
-use app::{SandboxHandle, SandboxLaunchConfig, SandboxWorkerConfig};
+use app::session::{
+    SessionConfig, SessionError, SessionErrorKind, SessionManagerHandle, SessionRequest,
+    spawn_session_manager,
+};
+use app::{SandboxLaunchConfig, SandboxWorkerConfig};
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -17,8 +18,11 @@ use axum::routing::{get, post};
 use rlm::prompts::DEFAULT_QUERY;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
+use tower_http::compression::CompressionLayer;
+use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -27,12 +31,16 @@ struct AppConfig {
     model: String,
     max_sessions: usize,
     max_inflight: usize,
+    ingress_capacity: usize,
     sandbox_pool_size: usize,
 }
 
-const DEFAULT_MAX_SESSIONS: usize = 128;
-const DEFAULT_MAX_INFLIGHT: usize = 32;
-const DEFAULT_SANDBOX_POOL_SIZE: usize = 4;
+const DEFAULT_MAX_SESSIONS: usize = 256;
+const DEFAULT_MAX_INFLIGHT: usize = 128;
+const DEFAULT_INGRESS_CAPACITY: usize = 2048;
+const DEFAULT_SANDBOX_POOL_SIZE: usize = 8;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 1800;
+
 const MAX_SESSION_ID_LEN: usize = 64;
 const OPENAI_MAX_INPUT_STRING_BYTES: usize = 10_485_760;
 const MAX_LLM_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
@@ -53,25 +61,16 @@ impl AppConfig {
 
 #[derive(Clone)]
 struct AppState {
-    sender: mpsc::UnboundedSender<SessionRequest>,
+    sessions: SessionManagerHandle,
     config: AppConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct ReplResponse {
-    session_id: String,
-    response: Option<String>,
-    stdout: Option<String>,
-    stderr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiChatCompletionsRequest {
+    #[serde(default)]
     messages: Vec<OpenAiChatMessage>,
     model: Option<String>,
     stream: Option<bool>,
-    max_tokens: Option<u32>,
-    max_completion_tokens: Option<u32>,
     reset: Option<bool>,
 }
 
@@ -111,30 +110,25 @@ struct OpenAiUsage {
     total_tokens: usize,
 }
 
-struct SessionRequest {
-    session_id: String,
-    reset: bool,
-    query: String,
-    context: Option<Value>,
-    code: Option<String>,
-    respond_to: oneshot::Sender<Result<ReplResponse, String>>,
+#[derive(Debug, Serialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
 }
 
-struct SessionTask {
-    session_id: String,
-    reset: bool,
-    query: String,
-    context: Option<Value>,
-    code: Option<String>,
+#[derive(Debug, Serialize)]
+struct OpenAiErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: String,
+    param: Option<String>,
 }
 
-struct SessionSandbox {
-    handle: Box<dyn SandboxHandle>,
-    initialized: bool,
-}
-
-async fn healthcheck() -> StatusCode {
-    StatusCode::OK
+async fn healthcheck() -> Response {
+    let mut response = StatusCode::OK.into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn log_request_response(request: Request, next: Next) -> Response {
@@ -155,69 +149,96 @@ async fn openai_chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<OpenAiChatCompletionsRequest>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Response {
     let OpenAiChatCompletionsRequest {
         messages,
         model,
         stream,
-        max_tokens,
-        max_completion_tokens,
         reset,
     } = payload;
-
     if stream.unwrap_or(false) {
-        return Err((
+        return openai_error_response(
             StatusCode::BAD_REQUEST,
-            "stream=true unsupported; use stream=false".to_owned(),
-        ));
+            "stream=true unsupported; use stream=false",
+            "invalid_request_error",
+        );
     }
     if messages.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "messages required".to_owned()));
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "messages required",
+            "invalid_request_error",
+        );
     }
-    validate_openai_input(&messages)?;
+    if let Err((status, message)) = validate_openai_input(&messages) {
+        return openai_error_response(status, &message, "invalid_request_error");
+    }
 
     let model = model.unwrap_or_else(|| state.config.model.clone());
     if model != state.config.model {
-        return Err((
+        return openai_error_response(
             StatusCode::BAD_REQUEST,
-            format!(
+            &format!(
                 "model override unsupported; expected {}",
                 state.config.model
             ),
-        ));
+            "invalid_request_error",
+        );
     }
-    let _ = max_completion_tokens.or(max_tokens);
+    let session_id = match session_id_from_transport(&headers) {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => Uuid::new_v4().to_string(),
+        Err((status, message)) => {
+            return openai_error_response(status, &message, "invalid_request_error");
+        }
+    };
+    let reset = match header_bool(&headers, "x-rlm-reset") {
+        Ok(header_reset) => reset.unwrap_or(false) || header_reset,
+        Err((status, message)) => {
+            return openai_error_response(status, &message, "invalid_request_error");
+        }
+    };
+    let (query, context) = (
+        openai_query_from_messages(&messages),
+        Some(openai_context_from_messages(messages)),
+    );
 
-    let session_id =
-        session_id_from_transport(&headers)?.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let reset = reset.unwrap_or(false) || header_bool(&headers, "x-rlm-reset")?;
-    let query = openai_query_from_messages(&messages);
-    let context = Some(openai_context_from_messages(messages));
-
-    let (respond_to, response) = oneshot::channel();
-    state
-        .sender
-        .send(SessionRequest {
-            session_id: session_id.clone(),
-            reset,
-            query,
-            context,
-            code: None,
-            respond_to,
-        })
-        .map_err(internal_error)?;
-    let response = response
-        .await
-        .map_err(internal_error)?
-        .map_err(internal_error)?;
-    let content = response
-        .response
-        .ok_or_else(|| internal_error("missing assistant response"))?;
+    let (respond_to, response_rx) = oneshot::channel();
+    if let Err(err) = state.sessions.try_dispatch(SessionRequest {
+        session_id: session_id.clone(),
+        reset,
+        query,
+        context,
+        code: None,
+        respond_to,
+    }) {
+        return session_error_response(err);
+    }
+    let response = match response_rx.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return session_error_response(err),
+        Err(_) => {
+            return openai_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session response channel closed",
+                "server_error",
+            );
+        }
+    };
+    let content = match response.response {
+        Some(content) => content,
+        None => {
+            return openai_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing assistant response",
+                "server_error",
+            );
+        }
+    };
 
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(internal_error)?
-        .as_secs();
+        .map_or(0, |duration| duration.as_secs());
     let body = OpenAiChatCompletionsResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
         object: "chat.completion".to_owned(),
@@ -239,12 +260,42 @@ async fn openai_chat_completions_handler(
     };
 
     let mut response = Json(body).into_response();
-    set_session_response_headers(&mut response, &session_id)?;
-    Ok(response)
+    if let Err((status, message)) = set_session_response_headers(&mut response, &session_id) {
+        return openai_error_response(status, &message, "server_error");
+    }
+    response
 }
 
 fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+fn session_error_response(err: SessionError) -> Response {
+    match err.kind {
+        SessionErrorKind::Overloaded => openai_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &err.message,
+            "server_error",
+        ),
+        SessionErrorKind::Internal => openai_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &err.message,
+            "server_error",
+        ),
+    }
+}
+
+fn openai_error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
+    let mut response = Json(OpenAiErrorEnvelope {
+        error: OpenAiErrorBody {
+            message: message.to_owned(),
+            error_type: error_type.to_owned(),
+            param: None,
+        },
+    })
+    .into_response();
+    *response.status_mut() = status;
+    response
 }
 
 fn validate_openai_input(messages: &[OpenAiChatMessage]) -> Result<(), (StatusCode, String)> {
@@ -397,154 +448,6 @@ fn openai_context_from_messages(messages: Vec<OpenAiChatMessage>) -> Value {
     )
 }
 
-fn touch_session(order: &mut VecDeque<String>, session_id: &str) {
-    if let Some(pos) = order.iter().position(|id| id == session_id) {
-        order.remove(pos);
-    }
-    order.push_back(session_id.to_owned());
-}
-
-fn remove_session(order: &mut VecDeque<String>, session_id: &str) {
-    if let Some(pos) = order.iter().position(|id| id == session_id) {
-        order.remove(pos);
-    }
-}
-
-fn enforce_max_sessions(
-    sessions: &mut HashMap<String, SessionSandbox>,
-    order: &mut VecDeque<String>,
-    max_sessions: usize,
-) -> Vec<SessionSandbox> {
-    let mut evicted_sessions = Vec::new();
-    while order.len() > max_sessions {
-        if let Some(evicted) = order.pop_front()
-            && let Some(session) = sessions.remove(&evicted)
-        {
-            evicted_sessions.push(session);
-        }
-    }
-    evicted_sessions
-}
-
-fn spawn_session_worker(
-    config: AppConfig,
-) -> Result<mpsc::UnboundedSender<SessionRequest>, Box<dyn std::error::Error>> {
-    let launcher = build_launcher(config.to_launch_config());
-    let mut pool = SandboxPool::new(launcher, config.sandbox_pool_size)
-        .map_err(|err| format!("failed to initialize sandbox pool: {err}"))?;
-    let (sender, mut receiver) = mpsc::unbounded_channel::<SessionRequest>();
-    std::thread::spawn(move || {
-        let mut sessions: HashMap<String, SessionSandbox> = HashMap::new();
-        let mut session_order: VecDeque<String> = VecDeque::new();
-        while let Some(req) = receiver.blocking_recv() {
-            let SessionRequest {
-                session_id,
-                reset,
-                query,
-                context,
-                code,
-                respond_to,
-            } = req;
-            let task = SessionTask {
-                session_id,
-                reset,
-                query,
-                context,
-                code,
-            };
-            let result = handle_session_request_inner(
-                &config,
-                &mut pool,
-                &mut sessions,
-                &mut session_order,
-                task,
-            );
-            let _ = respond_to.send(result);
-        }
-        for (_, session) in sessions.drain() {
-            pool.retire(session.handle);
-        }
-    });
-    Ok(sender)
-}
-
-fn handle_session_request_inner(
-    config: &AppConfig,
-    pool: &mut SandboxPool,
-    sessions: &mut HashMap<String, SessionSandbox>,
-    session_order: &mut VecDeque<String>,
-    task: SessionTask,
-) -> Result<ReplResponse, String> {
-    let SessionTask {
-        session_id,
-        reset,
-        query,
-        context,
-        code,
-    } = task;
-    if reset {
-        if let Some(session) = sessions.remove(&session_id) {
-            pool.retire(session.handle);
-        }
-        remove_session(session_order, &session_id);
-    }
-    let is_new_session = !sessions.contains_key(&session_id);
-    if is_new_session {
-        let handle = pool.acquire()?;
-        sessions.insert(
-            session_id.clone(),
-            SessionSandbox {
-                handle,
-                initialized: false,
-            },
-        );
-    }
-    touch_session(session_order, &session_id);
-    let evicted = enforce_max_sessions(sessions, session_order, config.max_sessions);
-    for evicted_session in evicted {
-        pool.retire(evicted_session.handle);
-    }
-
-    let run_result = {
-        let session = sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| "session init failed".to_owned())?;
-        let initialize = !session.initialized;
-        let request = SandboxRunRequest {
-            initialize,
-            query: query.clone(),
-            context,
-            code,
-        };
-        match session.handle.run(request) {
-            Ok(result) => {
-                if initialize {
-                    session.initialized = true;
-                }
-                Ok(result)
-            }
-            Err(err) => Err(err),
-        }
-    };
-    let run_result = match run_result {
-        Ok(result) => result,
-        Err(err) => {
-            if let Some(session) = sessions.remove(&session_id) {
-                pool.retire(session.handle);
-            }
-            remove_session(session_order, &session_id);
-            return Err(err);
-        }
-    };
-
-    Ok(ReplResponse {
-        session_id,
-        response: run_result.response,
-        stdout: run_result.stdout,
-        stderr: run_result.stderr,
-    })
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key =
@@ -554,12 +457,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: "gpt-5".to_owned(),
         max_sessions: DEFAULT_MAX_SESSIONS,
         max_inflight: DEFAULT_MAX_INFLIGHT,
+        ingress_capacity: DEFAULT_INGRESS_CAPACITY,
         sandbox_pool_size: DEFAULT_SANDBOX_POOL_SIZE,
     };
 
-    // spawn session worker before tokio runtime so RustPython remains single-threaded (gVisor issue)
-    let sender = spawn_session_worker(config.clone())?;
-    let state = AppState { sender, config };
+    let launcher = build_launcher(config.to_launch_config());
+    let sessions = spawn_session_manager(
+        SessionConfig {
+            max_sessions: config.max_sessions,
+            ingress_capacity: config.ingress_capacity,
+            sandbox_pool_size: config.sandbox_pool_size,
+        },
+        launcher,
+    )
+    .map_err(|err| format!("failed to initialize session manager: {err}"))?;
+    let state = AppState { sessions, config };
 
     let host = "0.0.0.0";
     let port = 3000;
@@ -570,13 +482,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_time()
         .build()?;
     rt.block_on(async move {
+        let chat_timeout = Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS);
         let app = Router::new()
             .route("/healthz", get(healthcheck))
             .route(
                 "/v1/chat/completions",
-                post(openai_chat_completions_handler)
-                    .layer(DefaultBodyLimit::max(MAX_LLM_BODY_LIMIT_BYTES)),
+                post(openai_chat_completions_handler).layer(
+                    ServiceBuilder::new()
+                        .layer(DefaultBodyLimit::max(MAX_LLM_BODY_LIMIT_BYTES))
+                        .layer(TimeoutLayer::with_status_code(
+                            StatusCode::REQUEST_TIMEOUT,
+                            chat_timeout,
+                        )),
+                ),
             )
+            .layer(CompressionLayer::new())
             .layer(ConcurrencyLimitLayer::new(state.config.max_inflight))
             .layer(middleware::from_fn(log_request_response))
             .with_state(state);

@@ -2,8 +2,6 @@ use goose::prelude::*;
 use rand::Rng;
 use serde_json::json;
 
-const TARGET_CONTEXT_BYTES: usize = 220 * 1024;
-
 async fn setup_custom_client(user: &mut GooseUser) -> TransactionResult {
     use reqwest::Client;
 
@@ -16,6 +14,7 @@ fn llm_payload(query: &str, context: &str) -> serde_json::Value {
     json!({
         "model": "gpt-5",
         "stream": false,
+        "reset": true,
         "messages": [
             {
                 "role": "user",
@@ -25,7 +24,7 @@ fn llm_payload(query: &str, context: &str) -> serde_json::Value {
     })
 }
 
-fn generate_massive_context(target_bytes: usize, answer: &str) -> String {
+fn generate_small_context(num_lines: usize, answer: &str) -> String {
     let random_words = [
         "blah",
         "random",
@@ -36,31 +35,22 @@ fn generate_massive_context(target_bytes: usize, answer: &str) -> String {
         "sample",
     ];
     let mut rng = rand::rng();
-    let mut context = String::with_capacity(target_bytes + 1024);
-    let mut inserted_answer = false;
-    let insertion_point = target_bytes / 2;
-    while context.len() < target_bytes {
-        if !inserted_answer && context.len() >= insertion_point {
-            context.push_str(&format!("The magic number is {answer}\n"));
-            inserted_answer = true;
-        }
+    let mut lines = Vec::with_capacity(num_lines);
+    for _ in 0..num_lines {
         let num_words = rng.random_range(3..=8);
         let line_words: Vec<&str> = (0..num_words)
             .map(|_| random_words[rng.random_range(0..random_words.len())])
             .collect();
-        context.push_str(&line_words.join(" "));
-        context.push('\n');
+        lines.push(line_words.join(" "));
     }
-
-    if !inserted_answer {
-        context.push_str(&format!("The magic number is {answer}\n"));
-    }
-    context
+    let magic_position = rng.random_range(4_000..6_000);
+    lines[magic_position] = format!("The magic number is {answer}");
+    lines.join("\n")
 }
 
 async fn llm_roundtrip(user: &mut GooseUser) -> TransactionResult {
     let answer: String = rand::rng().random_range(1_000_000..9_999_999).to_string();
-    let context = generate_massive_context(TARGET_CONTEXT_BYTES, &answer);
+    let context = generate_small_context(10_000, &answer);
     let query = "I'm looking for a magic number. What is it?";
     let payload = llm_payload(query, &context);
     let mut goose = user.post_json("/v1/chat/completions", &payload).await?;
@@ -93,8 +83,16 @@ async fn llm_roundtrip(user: &mut GooseUser) -> TransactionResult {
         .and_then(|choice| choice.get("message"))
         .and_then(|message| message.get("content"))
         .and_then(|value| value.as_str());
-    if content.is_none() {
+    let Some(content) = content else {
         return user.set_failure("missing content", &mut goose.request, None, Some(&body));
+    };
+    if !content.contains(&answer) {
+        return user.set_failure(
+            "incorrect magic number",
+            &mut goose.request,
+            None,
+            Some(&body),
+        );
     }
     Ok(())
 }

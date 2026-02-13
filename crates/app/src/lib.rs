@@ -2,6 +2,7 @@ pub mod client;
 pub mod launcher;
 pub mod pool;
 pub mod protocol;
+pub mod session;
 
 use protocol::{SandboxRunRequest, SandboxRunResult};
 

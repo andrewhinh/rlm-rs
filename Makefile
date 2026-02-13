@@ -26,7 +26,7 @@ goose:
 	cargo run -p app --bin goose -- \
 		--host "$(HOST)" \
 		--timeout 86400 \
-		--users 20 --run-time 1m \
+		--users 20 --run-time 5m \
 		--report-file logs/report-$(shell date +"%Y-%m-%d_%H-%M-%S").html \
 		--request-log logs/request-$(shell date +"%Y-%m-%d_%H-%M-%S").json
 
