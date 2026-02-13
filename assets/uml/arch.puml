@@ -1,0 +1,39 @@
+@startuml arch
+
+actor Client
+cloud "OpenAI API" as OpenAI
+
+node "app" as App {
+  component "/v1/chat/completions" as Endpoint
+  queue "IngressQueue" as Ingress
+  component "SessionManagerThread" as SessionManager
+  database "SessionActorMap" as ActorMap
+  component "SessionActor(s)" as Actors
+  component "PoolBrokerThread" as PoolBroker
+  component "SandboxPool" as Pool
+}
+
+node "docker" as DockerHost {
+  node "container(s)" as Containers {
+    component "sandbox_worker(s)" as Workers
+    component "RlmRepl + RustPython VM" as Repls
+    database "SharedProgramState" as State
+  }
+}
+
+Client --> Endpoint : POST + x-rlm-session-id / rlm_session cookie
+Endpoint --> Ingress : try_dispatch(SessionRequest)
+Ingress --> SessionManager : recv
+SessionManager --> ActorMap : route
+SessionManager --> Actors : dispatch
+
+Actors --> PoolBroker : acquire/retire
+PoolBroker --> Pool : single owner
+Pool --> DockerHost : docker run --runtime=runsc
+
+Actors --> Workers : run(request)
+Workers --> Repls : execute
+Repls --> State : state_get/state_set/state_del
+Repls --> OpenAI : async chat/completions
+
+@enduml

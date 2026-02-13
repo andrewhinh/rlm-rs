@@ -67,17 +67,29 @@ make goose HOST=<host>
 - [x] unblock event loop
 - [x] add support for depth > 1
 - [x] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
-- [ ] add per-session REPL sandboxing with gVisor
+- [x] add per-session REPL sandboxing with gVisor
 
 ## Details
 
-This diagram shows the async runtime flow:
+### Sandboxing
+
+![arch](./assets/arch.png)
+
+Requests within a session remain ordered while different sessions execute concurrently, so one long-running REPL interaction does not create cross-session head-of-line blocking for unrelated traffic. Ingress is bounded and fails fast under saturation instead of queueing indefinitely, and pool ownership is centralized in a single broker to avoid contention around mutable container state.
+
+### Async Runtime
 
 ![async](./assets/async.png)
 
-When the model emits REPL code, the Tokio loop dispatches `Execute` and `GetVariable` commands through `ReplHandle` using the `mpsc` and `oneshot` channels to a dedicated REPL worker thread, which prevents RustPython `interpreter.enter` work from blocking Tokio worker threads.
+The async runtime separates network-facing work from interpreter execution so that blocking Python operations do not starve request handling or model I/O. REPL commands are dispatched through channels to a dedicated worker thread, which isolates synchronous interpreter calls from the async control plane. A persistent REPL worker is used to preserve interpreter-local state across iterative commands and to avoid per-command thread startup costs.
 
-This approach is better than 1) running RustPython directly on Tokio workers, which reduces concurrency under load, and 2) spawning a fresh thread per REPL call, which adds scheduling overhead and complicates state reuse. Inside Python, `llm_query(...)` returns to async model calls through the captured runtime handle, while startup context generation is offloaded with `spawn_blocking`.
+### Load Testing
+
+The load test runs 20 simulated users for 3 minutes against `/v1/chat/completions`.
+
+![request](./assets/request.png)
+
+![response](./assets/response.png)
 
 ## Credit
 

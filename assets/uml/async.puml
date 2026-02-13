@@ -57,6 +57,17 @@ Llm --> Tokio: text
 Tokio --> Core: text
 Core --> Py: return llm_query output
 
+== Sub-RLM call from Python (i.e., rlm_query) ==
+Py -> Core: __rlm_rlm_query(payload)
+Core -> Tokio: runtime_handle.block_on(async recursive completion)
+Tokio -> Rlm: completion(context, query).await (nested)
+note right of Rlm
+  follows Root
+end note
+Rlm --> Tokio: nested final answer
+Tokio --> Core: JSON outputs
+Core --> Py: return rlm_query output
+
 == Result ==
 Rlm --> Main: final answer
 
