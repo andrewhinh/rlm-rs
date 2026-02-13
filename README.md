@@ -85,7 +85,7 @@ The async runtime separates network-facing work from interpreter execution so th
 
 ### Load Testing
 
-The load test runs 20 simulated users for 3 minutes against `/v1/chat/completions`.
+The load test runs 20 simulated users for 5 minutes against `/v1/chat/completions`.
 
 ![request](./assets/request.png)
 
