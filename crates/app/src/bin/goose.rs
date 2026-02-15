@@ -2,6 +2,10 @@ use goose::prelude::*;
 use rand::Rng;
 use serde_json::json;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 async fn setup_custom_client(user: &mut GooseUser) -> TransactionResult {
     use reqwest::Client;
 

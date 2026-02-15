@@ -76,9 +76,9 @@ impl LlmClientImpl {
 }
 
 #[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<Message>,
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [Message],
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,8 +109,8 @@ impl LlmClient for LlmClientImpl {
     ) -> Result<String, LlmError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = ChatRequest {
-            model: self.model.clone(),
-            messages: messages.to_vec(),
+            model: &self.model,
+            messages,
             max_completion_tokens,
             max_tokens: max_completion_tokens,
         };
@@ -127,8 +127,9 @@ impl LlmClient for LlmClientImpl {
         let parsed: ChatResponse = response.json().await?;
         let content = parsed
             .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone())
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message.content)
             .ok_or(LlmError::InvalidResponse)?;
 
         Ok(content)

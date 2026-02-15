@@ -55,7 +55,6 @@ Run `make help` for the full list of commands.
 For both Linux and EC2 instances:
 
 ```bash
-cargo test
 cargo run
 make app
 make goose HOST=<host>

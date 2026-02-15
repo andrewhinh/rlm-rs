@@ -1,8 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
-use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -155,16 +154,23 @@ fn run_session_manager_loop(
     finished_sender: Sender<ActorFinished>,
     pool_sender: Sender<PoolCommand>,
 ) {
-    let mut actors: HashMap<String, ActorEntry> = HashMap::new();
-    let mut idle_lru: VecDeque<String> = VecDeque::new();
+    let session_capacity = config.max_sessions.max(1);
+    let mut actors: HashMap<String, ActorEntry> = HashMap::with_capacity(session_capacity);
+    let mut idle_lru: VecDeque<String> = VecDeque::with_capacity(session_capacity);
+    let mut idle_index: HashSet<String> = HashSet::with_capacity(session_capacity);
 
     loop {
-        drain_finished_events(&finished_receiver, &mut actors, &mut idle_lru);
-        let request = match request_receiver.recv_timeout(Duration::from_millis(10)) {
+        let request = match request_receiver.recv() {
             Ok(request) => request,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         };
+        drain_finished_events(
+            &finished_receiver,
+            &mut actors,
+            &mut idle_lru,
+            &mut idle_index,
+            4096,
+        );
         let SessionRequest {
             session_id,
             reset,
@@ -175,7 +181,12 @@ fn run_session_manager_loop(
         } = request;
 
         if !actors.contains_key(&session_id) {
-            if !evict_until_capacity(&mut actors, &mut idle_lru, config.max_sessions) {
+            if !evict_until_capacity(
+                &mut actors,
+                &mut idle_lru,
+                &mut idle_index,
+                config.max_sessions.max(1),
+            ) {
                 let _ = respond_to.send(Err(SessionError::overloaded(
                     "max sessions reached; no idle session available",
                 )));
@@ -207,7 +218,7 @@ fn run_session_manager_loop(
             .get_mut(&session_id)
             .expect("session actor inserted before dispatch");
 
-        remove_from_idle_lru(&mut idle_lru, &session_id);
+        remove_from_idle_lru(&mut idle_index, &session_id);
         entry.pending += 1;
         entry.state = if reset {
             SessionActorState::ResetPending
@@ -227,8 +238,15 @@ fn run_session_manager_loop(
                 .respond_to
                 .send(Err(SessionError::internal("failed to dispatch to actor")));
             actors.remove(&session_id);
-            remove_from_idle_lru(&mut idle_lru, &session_id);
+            remove_from_idle_lru(&mut idle_index, &session_id);
         }
+        drain_finished_events(
+            &finished_receiver,
+            &mut actors,
+            &mut idle_lru,
+            &mut idle_index,
+            512,
+        );
     }
 
     actors.clear();
@@ -237,10 +255,11 @@ fn run_session_manager_loop(
 fn evict_until_capacity(
     actors: &mut HashMap<String, ActorEntry>,
     idle_lru: &mut VecDeque<String>,
+    idle_index: &mut HashSet<String>,
     max_sessions: usize,
 ) -> bool {
     while actors.len() >= max_sessions {
-        if !evict_oldest_idle_actor(actors, idle_lru) {
+        if !evict_oldest_idle_actor(actors, idle_lru, idle_index) {
             return false;
         }
     }
@@ -251,16 +270,25 @@ fn drain_finished_events(
     finished_receiver: &Receiver<ActorFinished>,
     actors: &mut HashMap<String, ActorEntry>,
     idle_lru: &mut VecDeque<String>,
+    idle_index: &mut HashSet<String>,
+    max_batch: usize,
 ) {
-    while let Ok(finished) = finished_receiver.try_recv() {
+    let mut drained = 0usize;
+    while drained < max_batch {
+        let finished = match finished_receiver.try_recv() {
+            Ok(finished) => finished,
+            Err(_) => break,
+        };
+        drained += 1;
         let Some(entry) = actors.get_mut(&finished.session_id) else {
             continue;
         };
         entry.pending = entry.pending.saturating_sub(1);
         if entry.pending == 0 {
             entry.state = SessionActorState::Idle;
-            remove_from_idle_lru(idle_lru, &finished.session_id);
-            idle_lru.push_back(finished.session_id);
+            if idle_index.insert(finished.session_id.clone()) {
+                idle_lru.push_back(finished.session_id);
+            }
         } else {
             entry.state = SessionActorState::Busy;
         }
@@ -270,8 +298,12 @@ fn drain_finished_events(
 fn evict_oldest_idle_actor(
     actors: &mut HashMap<String, ActorEntry>,
     idle_lru: &mut VecDeque<String>,
+    idle_index: &mut HashSet<String>,
 ) -> bool {
     while let Some(session_id) = idle_lru.pop_front() {
+        if !idle_index.remove(&session_id) {
+            continue;
+        }
         let is_idle = actors
             .get(&session_id)
             .is_some_and(|entry| entry.pending == 0);
@@ -284,10 +316,8 @@ fn evict_oldest_idle_actor(
     false
 }
 
-fn remove_from_idle_lru(order: &mut VecDeque<String>, session_id: &str) {
-    if let Some(pos) = order.iter().position(|id| id == session_id) {
-        order.remove(pos);
-    }
+fn remove_from_idle_lru(idle_index: &mut HashSet<String>, session_id: &str) {
+    idle_index.remove(session_id);
 }
 
 fn spawn_pool_broker(mut pool: SandboxPool) -> Result<Sender<PoolCommand>, String> {
