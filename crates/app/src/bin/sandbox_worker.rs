@@ -6,6 +6,10 @@ use rlm::prompts::DEFAULT_QUERY;
 use rlm::rlm::{RlmConfig, RlmRepl};
 use rlm::utils::context_from_value;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = worker_config_from_env()?;
     let mut repl = RlmRepl::new(config)?;

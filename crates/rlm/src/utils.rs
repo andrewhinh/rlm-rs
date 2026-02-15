@@ -1,9 +1,18 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde_json::Value;
 
 use crate::llm::Message;
 use crate::logger::{Logger, ReplEnvLogger};
 use crate::repl::{ReplHandle, ReplResult};
+
+static CODE_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"```repl\s*\n(?s:(.*?))\n```").expect("regex"));
+static FINAL_VAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?ms)^\s*FINAL_VAR\((.*?)\)").expect("regex"));
+static FINAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?ms)^\s*FINAL\((.*?)\)").expect("regex"));
 
 #[derive(Clone, Debug)]
 pub enum ContextInput {
@@ -157,8 +166,7 @@ fn normalize_context_json(value: Value) -> Value {
 }
 
 pub fn find_code_blocks(text: &str) -> Vec<String> {
-    let pattern = Regex::new(r"```repl\s*\n(?s:(.*?))\n```").expect("regex");
-    pattern
+    CODE_BLOCK_RE
         .captures_iter(text)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().trim().to_owned()))
         .collect()
@@ -170,12 +178,10 @@ pub enum FinalAnswerKind {
 }
 
 pub fn find_final_answer(text: &str) -> Option<(FinalAnswerKind, String)> {
-    let final_var_re = Regex::new(r"(?ms)^\s*FINAL_VAR\((.*?)\)").expect("regex");
-    if let Some(cap) = final_var_re.captures(text) {
+    if let Some(cap) = FINAL_VAR_RE.captures(text) {
         return Some((FinalAnswerKind::FinalVar, cap[1].trim().to_owned()));
     }
-    let final_re = Regex::new(r"(?ms)^\s*FINAL\((.*?)\)").expect("regex");
-    if let Some(cap) = final_re.captures(text) {
+    if let Some(cap) = FINAL_RE.captures(text) {
         return Some((FinalAnswerKind::Final, cap[1].trim().to_owned()));
     }
     None
@@ -222,6 +228,14 @@ pub fn format_execution_result(result: &ReplResult) -> String {
                 local.repr.clone()
             };
             vars.push(format!("{}={}", local.name, display));
+        }
+        if vars.is_empty() {
+            for local in &result.locals {
+                if should_skip_var_name(&local.name) {
+                    continue;
+                }
+                vars.push(format!("{}={}", local.name, local.repr));
+            }
         }
         if vars.is_empty() {
             for (name, repr) in &result.locals_map {
@@ -294,14 +308,33 @@ pub async fn process_code_execution(
     disable_recursive: bool,
 ) {
     let code_blocks = find_code_blocks(response);
+    process_code_execution_blocks(
+        &code_blocks,
+        messages,
+        repl_env,
+        repl_env_logger,
+        logger,
+        disable_recursive,
+    )
+    .await;
+}
+
+pub async fn process_code_execution_blocks(
+    code_blocks: &[String],
+    messages: &mut Vec<Message>,
+    repl_env: &ReplHandle,
+    repl_env_logger: &mut ReplEnvLogger,
+    logger: &Logger,
+    disable_recursive: bool,
+) {
     for code in code_blocks {
-        let execution_result = execute_code(repl_env, &code, repl_env_logger, logger).await;
+        let execution_result = execute_code(repl_env, code, repl_env_logger, logger).await;
         let max_len = if disable_recursive {
             usize::MAX
         } else {
             100_000
         };
-        add_execution_result_to_messages(messages, &code, &execution_result, max_len);
+        add_execution_result_to_messages(messages, code, &execution_result, max_len);
     }
 }
 

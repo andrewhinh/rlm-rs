@@ -6,7 +6,7 @@ use crate::prompts::{DEFAULT_QUERY, REPL_SYSTEM_PROMPT, build_system_prompt, nex
 use crate::repl::{RecursiveRunner, ReplHandle, ReplResult, SharedProgramState};
 use crate::utils::{
     ContextInput, check_for_final_answer, convert_context_for_repl, find_code_blocks,
-    process_code_execution,
+    process_code_execution_blocks,
 };
 
 #[derive(Clone)]
@@ -164,8 +164,8 @@ impl RlmRepl {
                 .log_model_response(&response, !code_blocks.is_empty());
 
             if !code_blocks.is_empty() {
-                process_code_execution(
-                    &response,
+                process_code_execution_blocks(
+                    &code_blocks,
                     &mut self.messages,
                     &repl_env,
                     &mut self.repl_env_logger,

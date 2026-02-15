@@ -3,6 +3,10 @@ use std::time::Instant;
 
 use rlm::rlm::{RlmConfig, RlmRepl};
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn generate_massive_context(num_lines: usize, answer: &str) -> String {
     println!("Generating massive context with {num_lines} lines");
 

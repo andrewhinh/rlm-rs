@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -50,18 +51,28 @@ struct RlmQueryPayload {
 #[derive(Clone, Default)]
 pub struct SharedProgramState {
     data: Arc<Mutex<Map<String, Value>>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl SharedProgramState {
     pub fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(Map::new())),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn clear(&self) {
         let mut state = self.data.lock().expect("shared state lock poisoned");
+        if state.is_empty() {
+            return;
+        }
         state.clear();
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn snapshot_json_string(&self) -> anyhow::Result<String> {
@@ -75,11 +86,47 @@ impl SharedProgramState {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("shared state must be a JSON object"))?;
         let mut state = self.data.lock().expect("shared state lock poisoned");
+        let mut changed = false;
         for key in deleted_keys {
-            state.remove(key);
+            if state.remove(key).is_some() {
+                changed = true;
+            }
         }
         for (key, value) in next_state {
-            state.insert(key.clone(), value.clone());
+            if state.get(key) != Some(value) {
+                state.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn apply_delta_from_json(
+        &self,
+        changed_values: Value,
+        deleted_keys: &[String],
+    ) -> anyhow::Result<()> {
+        let next_state = changed_values
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("state delta must be a JSON object"))?;
+        let mut state = self.data.lock().expect("shared state lock poisoned");
+        let mut changed = false;
+        for key in deleted_keys {
+            if state.remove(key).is_some() {
+                changed = true;
+            }
+        }
+        for (key, value) in next_state {
+            if state.get(key) != Some(value) {
+                state.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(())
     }
@@ -137,6 +184,8 @@ pub struct ReplEnv {
     recursion_depth: usize,
     shared_state: SharedProgramState,
     execution_lock: Mutex<()>,
+    last_hydrated_revision: AtomicU64,
+    collect_detailed_locals: bool,
 }
 
 impl ReplEnv {
@@ -161,6 +210,7 @@ impl ReplEnv {
             })?;
         let temp_dir = TempDir::new()?;
 
+        let initial_revision = shared_state.revision();
         let mut env = Self {
             interpreter,
             scope,
@@ -171,6 +221,8 @@ impl ReplEnv {
             recursion_depth,
             shared_state,
             execution_lock: Mutex::new(()),
+            last_hydrated_revision: AtomicU64::new(initial_revision),
+            collect_detailed_locals: cfg!(debug_assertions),
         };
         env.initialize(context)?;
         if let Some(code) = setup_code {
@@ -184,6 +236,7 @@ impl ReplEnv {
         let runtime_handle = self.runtime_handle.clone();
         let recursive_runner = self.recursive_runner.clone();
         let recursion_depth = self.recursion_depth;
+        let shared_state_revision = self.shared_state.revision();
         let shared_state_json = self.shared_state.snapshot_json_string()?;
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
@@ -314,6 +367,7 @@ else:
     "ResourceWarning", "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
     "AttributeError", "FileNotFoundError", "OSError", "IOError", "RuntimeError", "NameError",
     "ImportError", "StopIteration", "GeneratorExit", "SystemExit", "KeyboardInterrupt",
+    "__build_class__",
 ]"#,
                 ),
                 (
@@ -366,8 +420,59 @@ def __rlm_safe_open(path, *args, _import=__rlm_import_builtin, _open=__rlm_open_
                 (
                     "state_init",
                     r#"import json
-state = json.loads(__rlm_shared_state_json)
+__name__ = '__main__'
 __rlm_state_deleted_keys = set()
+__rlm_state_dirty_keys = set()
+
+class __rlm_TrackingDict(dict):
+    def __setitem__(self, key, value):
+        key = str(key)
+        __rlm_state_deleted_keys.discard(key)
+        __rlm_state_dirty_keys.add(key)
+        return super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        key = str(key)
+        __rlm_state_dirty_keys.discard(key)
+        __rlm_state_deleted_keys.add(key)
+        return super().__delitem__(key)
+
+    def pop(self, key, default=None):
+        key = str(key)
+        __rlm_state_dirty_keys.discard(key)
+        __rlm_state_deleted_keys.add(key)
+        return super().pop(key, default)
+
+    def clear(self):
+        for key in list(self.keys()):
+            __rlm_state_deleted_keys.add(str(key))
+            __rlm_state_dirty_keys.discard(str(key))
+        return super().clear()
+
+    def update(self, other=(), **kwargs):
+        if hasattr(other, "items"):
+            items = other.items()
+        else:
+            items = other
+        for key, value in items:
+            self[str(key)] = value
+        for key, value in kwargs.items():
+            self[str(key)] = value
+
+    def setdefault(self, key, default=None):
+        key = str(key)
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+def __rlm_replace_state(payload):
+    state.clear()
+    for key, value in payload.items():
+        dict.__setitem__(state, str(key), value)
+    __rlm_state_deleted_keys.clear()
+    __rlm_state_dirty_keys.clear()
+
+state = __rlm_TrackingDict(json.loads(__rlm_shared_state_json))
 
 def state_get(key, default=None):
     return state.get(str(key), default)
@@ -548,6 +653,8 @@ def llm_query(prompts):
             })
             .map_err(|err: vm::PyRef<PyBaseException>| anyhow::anyhow!("python init error: {err:?}"))?;
 
+        self.last_hydrated_revision
+            .store(shared_state_revision, Ordering::Release);
         Ok(())
     }
 
@@ -559,6 +666,7 @@ def llm_query(prompts):
         self.hydrate_shared_state()?;
         let scope = self.scope.clone();
         let temp_dir = self.temp_dir.path().to_path_buf();
+        let collect_detailed_locals = self.collect_detailed_locals;
         let start = Instant::now();
 
         let mut result = self
@@ -590,8 +698,12 @@ def llm_query(prompts):
 
             let stdout = get_string_from_scope(vm, &scope, "__rlm_stdout_value");
             let stderr = get_string_from_scope(vm, &scope, "__rlm_stderr_value");
-            let locals = collect_locals(vm, &scope);
-            let locals_map = collect_locals_map(vm, &scope);
+            let locals = collect_locals(vm, &scope, collect_detailed_locals);
+            let locals_map = if collect_detailed_locals {
+                collect_locals_map(vm, &scope)
+            } else {
+                Vec::new()
+            };
             Ok(ReplResult {
                 stdout,
                 stderr,
@@ -635,6 +747,10 @@ def llm_query(prompts):
     }
 
     fn hydrate_shared_state(&self) -> anyhow::Result<()> {
+        let revision = self.shared_state.revision();
+        if revision == self.last_hydrated_revision.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let scope = self.scope.clone();
         let shared_state_json = self.shared_state.snapshot_json_string()?;
         self.interpreter
@@ -644,29 +760,66 @@ def llm_query(prompts):
                     vm.ctx.new_str(shared_state_json.as_str()).into(),
                     vm,
                 )?;
-                let hydrate_code = "import json\n__rlm_state_incoming = json.loads(__rlm_shared_state_json)\nstate.clear()\nstate.update(__rlm_state_incoming)\n";
+                let hydrate_code = "import json\n__rlm_state_incoming = json.loads(__rlm_shared_state_json)\nif '__rlm_replace_state' in globals():\n    __rlm_replace_state(__rlm_state_incoming)\nelse:\n    state.clear()\n    state.update(__rlm_state_incoming)\n";
                 vm.run_string(scope.clone(), hydrate_code, "<rlm_state_hydrate>".to_owned())?;
                 Ok(())
             })
             .map_err(|err: vm::PyRef<PyBaseException>| {
                 anyhow::anyhow!("shared state hydrate error: {err:?}")
-            })
+            })?;
+        self.last_hydrated_revision
+            .store(revision, Ordering::Release);
+        Ok(())
     }
 
     fn sync_shared_state(&self) -> anyhow::Result<()> {
         let scope = self.scope.clone();
-        let (state_json, deleted_json) = self
+        let (delta_json, deleted_json, fallback_flag) = self
             .interpreter
-            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
-                let sync_code = "import json\n__rlm_state_sync_payload = json.dumps(state)\n__rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\n__rlm_state_deleted_keys.clear()\n";
+            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String, String)> {
+                let sync_code = "import json\n__rlm_state_sync_fallback = '0'\nif '__rlm_TrackingDict' in globals() and isinstance(state, __rlm_TrackingDict):\n    __rlm_state_delta_payload = json.dumps({key: state.get(key) for key in __rlm_state_dirty_keys})\n    __rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\n    __rlm_state_dirty_keys.clear()\n    __rlm_state_deleted_keys.clear()\nelse:\n    __rlm_state_sync_fallback = '1'\n    __rlm_state_delta_payload = '{}'\n    __rlm_state_deleted_payload = '[]'\n";
                 vm.run_string(scope.clone(), sync_code, "<rlm_state_sync>".to_owned())?;
-                let state_json = get_string_from_scope(vm, &scope, "__rlm_state_sync_payload");
+                let delta_json = get_string_from_scope(vm, &scope, "__rlm_state_delta_payload");
                 let deleted_json = get_string_from_scope(vm, &scope, "__rlm_state_deleted_payload");
-                Ok((state_json, deleted_json))
+                let fallback_flag = get_string_from_scope(vm, &scope, "__rlm_state_sync_fallback");
+                Ok((delta_json, deleted_json, fallback_flag))
             })
             .map_err(|err: vm::PyRef<PyBaseException>| {
                 anyhow::anyhow!(
                     "shared state sync error (values must be JSON serializable): {err:?}"
+                )
+            })?;
+        if fallback_flag == "1" {
+            self.sync_shared_state_full(&scope)?;
+            self.last_hydrated_revision
+                .store(self.shared_state.revision(), Ordering::Release);
+            return Ok(());
+        }
+        let changed_values: Value = serde_json::from_str(&delta_json)
+            .map_err(|err| anyhow::anyhow!("shared state delta parse error: {err}"))?;
+        let deleted_keys: Vec<String> = serde_json::from_str(&deleted_json)
+            .map_err(|err| anyhow::anyhow!("shared state delete parse error: {err}"))?;
+        self.shared_state
+            .apply_delta_from_json(changed_values, &deleted_keys)?;
+        self.last_hydrated_revision
+            .store(self.shared_state.revision(), Ordering::Release);
+        Ok(())
+    }
+
+    fn sync_shared_state_full(&self, scope: &Scope) -> anyhow::Result<()> {
+        let (state_json, deleted_json) = self
+            .interpreter
+            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
+                let sync_code = "import json\n__rlm_state_sync_payload = json.dumps(state)\n__rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\nif '__rlm_state_dirty_keys' in globals():\n    __rlm_state_dirty_keys.clear()\n__rlm_state_deleted_keys.clear()\n";
+                vm.run_string(scope.clone(), sync_code, "<rlm_state_sync_full>".to_owned())?;
+                let state_json = get_string_from_scope(vm, scope, "__rlm_state_sync_payload");
+                let deleted_json =
+                    get_string_from_scope(vm, scope, "__rlm_state_deleted_payload");
+                Ok((state_json, deleted_json))
+            })
+            .map_err(|err: vm::PyRef<PyBaseException>| {
+                anyhow::anyhow!(
+                    "shared state full sync error (values must be JSON serializable): {err:?}"
                 )
             })?;
         let state_value: Value = serde_json::from_str(&state_json)
@@ -884,7 +1037,7 @@ fn get_locals_dict(vm: &vm::VirtualMachine, scope: &Scope) -> Option<PyDictRef> 
         .and_then(|value| value.downcast::<vm::builtins::PyDict>().ok())
 }
 
-fn collect_locals(vm: &vm::VirtualMachine, scope: &Scope) -> Vec<LocalValue> {
+fn collect_locals(vm: &vm::VirtualMachine, scope: &Scope, detailed: bool) -> Vec<LocalValue> {
     let dict = match get_locals_dict(vm, scope) {
         Some(dict) => dict,
         None => return Vec::new(),
@@ -902,10 +1055,14 @@ fn collect_locals(vm: &vm::VirtualMachine, scope: &Scope) -> Vec<LocalValue> {
             } else {
                 None
             };
-            let repr = value
-                .repr(vm)
-                .map(|py_str| py_str.as_str().to_owned())
-                .unwrap_or_else(|_| format!("<{}>", value.class().name()));
+            let repr = if detailed || is_simple {
+                value
+                    .repr(vm)
+                    .map(|py_str| py_str.as_str().to_owned())
+                    .unwrap_or_else(|_| format!("<{}>", value.class().name()))
+            } else {
+                format!("<{}>", value.class().name())
+            };
             Some(LocalValue {
                 name,
                 repr,
@@ -950,6 +1107,10 @@ fn is_simple_type(vm: &vm::VirtualMachine, value: &vm::PyObjectRef) -> bool {
 }
 
 fn parse_llm_prompt(prompt: &str) -> Vec<Message> {
+    let trimmed = prompt.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return vec![Message::user(prompt)];
+    }
     match serde_json::from_str::<serde_json::Value>(prompt) {
         Ok(value) => messages_from_json(value).unwrap_or_else(|| vec![Message::user(prompt)]),
         Err(_) => vec![Message::user(prompt)],
