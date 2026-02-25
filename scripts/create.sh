@@ -16,7 +16,14 @@ fi
 AMI_ID="$(aws ssm get-parameters --region "$REGION" --names "$AMI_PARAM" \
   --query 'Parameters[0].Value' --output text)"
 SG_ID="$(aws ec2 describe-security-groups --region "$REGION" --group-names rlm-rs \
-  --query 'SecurityGroups[0].GroupId' --output text)"
+  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
+if [[ -z "${SG_ID}" || "${SG_ID}" == "None" ]]; then
+  VPC_ID="$(aws ec2 describe-vpcs --region "$REGION" \
+    --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
+  SG_ID="$(aws ec2 create-security-group --region "$REGION" \
+    --group-name rlm-rs --description "rlm-rs access" --vpc-id "$VPC_ID" \
+    --query 'GroupId' --output text)"
+fi
 
 INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI_ID" \

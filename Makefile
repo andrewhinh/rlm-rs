@@ -46,7 +46,7 @@ reboot:
 	bash scripts/reboot.sh $(ARG)
 
 aws-setup:
-	bash scripts/setup.sh
+	bash scripts/aws-setup.sh
 
 ec2-setup:
 	bash scripts/ec2-setup.sh
