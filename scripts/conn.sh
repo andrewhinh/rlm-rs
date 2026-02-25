@@ -54,7 +54,7 @@ if [[ -n "${SSH_CIDR}" ]]; then
     --query 'SecurityGroups[0].IpPermissions[?FromPort==`22` && ToPort==`22`].IpRanges[].CidrIp' \
     --output text)"
   EXISTING_SSH_CIDR_ARR=(${EXISTING_SSH_CIDRS})
-  if ! contains_value "${SSH_CIDR}" "${EXISTING_SSH_CIDR_ARR[@]}"; then
+  if ! contains_value "${SSH_CIDR}" "${EXISTING_SSH_CIDR_ARR[@]-}"; then
     aws ec2 authorize-security-group-ingress --region "$REGION" \
       --group-id "$SG_ID" --protocol tcp --port 22 --cidr "${SSH_CIDR}"
   fi
@@ -67,7 +67,7 @@ if [[ -n "${APP_CIDR}" ]]; then
     --query 'SecurityGroups[0].IpPermissions[?FromPort==`3000` && ToPort==`3000`].IpRanges[].CidrIp' \
     --output text)"
   EXISTING_APP_CIDR_ARR=(${EXISTING_APP_CIDRS})
-  if ! contains_value "${APP_CIDR}" "${EXISTING_APP_CIDR_ARR[@]}"; then
+  if ! contains_value "${APP_CIDR}" "${EXISTING_APP_CIDR_ARR[@]-}"; then
     aws ec2 authorize-security-group-ingress --region "$REGION" \
       --group-id "$SG_ID" --protocol tcp --port 3000 --cidr "${APP_CIDR}"
   fi
