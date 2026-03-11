@@ -672,46 +672,60 @@ def llm_query(prompts):
         let mut result = self
             .interpreter
             .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<ReplResult> {
-            let temp_dir_str = temp_dir.to_string_lossy().to_string();
-            scope.globals.set_item(
-                "__rlm_temp_dir",
-                vm.ctx.new_str(temp_dir_str.as_str()).into(),
-                vm,
-            )?;
-            let preamble = format!(
-                "import io, sys, time\n__rlm_old_stdout = sys.stdout\n__rlm_old_stderr = sys.stderr\n__rlm_stdout = io.StringIO()\n__rlm_stderr = io.StringIO()\nsys.stdout = __rlm_stdout\nsys.stderr = __rlm_stderr\n__rlm_exec_deadline = time.time() + {EXECUTION_TIMEOUT_SECS}\n\ndef __rlm_trace(frame, event, arg):\n    if time.time() > __rlm_exec_deadline:\n        raise TimeoutError('Execution time limit exceeded')\n    return __rlm_trace\n\nsys.settrace(__rlm_trace)\n"
-            );
-            vm.run_string(scope.clone(), &preamble, "<rlm_preamble>".to_owned())?;
-            scope
-                .globals
-                .set_item("__rlm_code", vm.ctx.new_str(code).into(), vm)?;
-            match vm.run_string(scope.clone(), "__rlm_exec(__rlm_code)\n", "<rlm_exec>".to_owned())
-            {
-                Ok(_) => {}
-                Err(exc) => {
-                    vm.print_exception(exc);
+                let temp_dir_str = temp_dir.to_string_lossy().to_string();
+                scope.globals.set_item(
+                    "__rlm_temp_dir",
+                    vm.ctx.new_str(temp_dir_str.as_str()).into(),
+                    vm,
+                )?;
+                let preamble = format!(
+                    "import io, sys, time\n__rlm_old_stdout = sys.stdout\n__rlm_old_stderr = \
+                     sys.stderr\n__rlm_stdout = io.StringIO()\n__rlm_stderr = \
+                     io.StringIO()\nsys.stdout = __rlm_stdout\nsys.stderr = \
+                     __rlm_stderr\n__rlm_exec_deadline = time.time() + \
+                     {EXECUTION_TIMEOUT_SECS}\n\ndef __rlm_trace(frame, event, arg):\n    if \
+                     time.time() > __rlm_exec_deadline:\n        raise TimeoutError('Execution \
+                     time limit exceeded')\n    return __rlm_trace\n\nsys.settrace(__rlm_trace)\n"
+                );
+                vm.run_string(scope.clone(), &preamble, "<rlm_preamble>".to_owned())?;
+                scope
+                    .globals
+                    .set_item("__rlm_code", vm.ctx.new_str(code).into(), vm)?;
+                match vm.run_string(
+                    scope.clone(),
+                    "__rlm_exec(__rlm_code)\n",
+                    "<rlm_exec>".to_owned(),
+                ) {
+                    Ok(_) => {}
+                    Err(exc) => {
+                        vm.print_exception(exc);
+                    }
                 }
-            }
 
-            let postamble = "import sys\nsys.settrace(None)\nsys.stdout = __rlm_old_stdout\nsys.stderr = __rlm_old_stderr\n__rlm_stdout_value = __rlm_stdout.getvalue()\n__rlm_stderr_value = __rlm_stderr.getvalue()\n__rlm_locals['_stdout'] = __rlm_stdout_value\n__rlm_locals['_stderr'] = __rlm_stderr_value\n";
-            vm.run_string(scope.clone(), postamble, "<rlm_postamble>".to_owned())?;
+                let postamble =
+                    "import sys\nsys.settrace(None)\nsys.stdout = __rlm_old_stdout\nsys.stderr = \
+                     __rlm_old_stderr\n__rlm_stdout_value = \
+                     __rlm_stdout.getvalue()\n__rlm_stderr_value = \
+                     __rlm_stderr.getvalue()\n__rlm_locals['_stdout'] = \
+                     __rlm_stdout_value\n__rlm_locals['_stderr'] = __rlm_stderr_value\n";
+                vm.run_string(scope.clone(), postamble, "<rlm_postamble>".to_owned())?;
 
-            let stdout = get_string_from_scope(vm, &scope, "__rlm_stdout_value");
-            let stderr = get_string_from_scope(vm, &scope, "__rlm_stderr_value");
-            let locals = collect_locals(vm, &scope, collect_detailed_locals);
-            let locals_map = if collect_detailed_locals {
-                collect_locals_map(vm, &scope)
-            } else {
-                Vec::new()
-            };
-            Ok(ReplResult {
-                stdout,
-                stderr,
-                locals,
-                locals_map,
-                execution_time: start.elapsed().as_secs_f64(),
+                let stdout = get_string_from_scope(vm, &scope, "__rlm_stdout_value");
+                let stderr = get_string_from_scope(vm, &scope, "__rlm_stderr_value");
+                let locals = collect_locals(vm, &scope, collect_detailed_locals);
+                let locals_map = if collect_detailed_locals {
+                    collect_locals_map(vm, &scope)
+                } else {
+                    Vec::new()
+                };
+                Ok(ReplResult {
+                    stdout,
+                    stderr,
+                    locals,
+                    locals_map,
+                    execution_time: start.elapsed().as_secs_f64(),
+                })
             })
-        })
             .map_err(|err: vm::PyRef<PyBaseException>| {
                 anyhow::anyhow!("python exec error: {err:?}")
             })?;
@@ -760,8 +774,16 @@ def llm_query(prompts):
                     vm.ctx.new_str(shared_state_json.as_str()).into(),
                     vm,
                 )?;
-                let hydrate_code = "import json\n__rlm_state_incoming = json.loads(__rlm_shared_state_json)\nif '__rlm_replace_state' in globals():\n    __rlm_replace_state(__rlm_state_incoming)\nelse:\n    state.clear()\n    state.update(__rlm_state_incoming)\n";
-                vm.run_string(scope.clone(), hydrate_code, "<rlm_state_hydrate>".to_owned())?;
+                let hydrate_code = "import json\n__rlm_state_incoming = \
+                                    json.loads(__rlm_shared_state_json)\nif '__rlm_replace_state' \
+                                    in globals():\n    \
+                                    __rlm_replace_state(__rlm_state_incoming)\nelse:\n    \
+                                    state.clear()\n    state.update(__rlm_state_incoming)\n";
+                vm.run_string(
+                    scope.clone(),
+                    hydrate_code,
+                    "<rlm_state_hydrate>".to_owned(),
+                )?;
                 Ok(())
             })
             .map_err(|err: vm::PyRef<PyBaseException>| {
@@ -776,14 +798,27 @@ def llm_query(prompts):
         let scope = self.scope.clone();
         let (delta_json, deleted_json, fallback_flag) = self
             .interpreter
-            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String, String)> {
-                let sync_code = "import json\n__rlm_state_sync_fallback = '0'\nif '__rlm_TrackingDict' in globals() and isinstance(state, __rlm_TrackingDict):\n    __rlm_state_delta_payload = json.dumps({key: state.get(key) for key in __rlm_state_dirty_keys})\n    __rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\n    __rlm_state_dirty_keys.clear()\n    __rlm_state_deleted_keys.clear()\nelse:\n    __rlm_state_sync_fallback = '1'\n    __rlm_state_delta_payload = '{}'\n    __rlm_state_deleted_payload = '[]'\n";
-                vm.run_string(scope.clone(), sync_code, "<rlm_state_sync>".to_owned())?;
-                let delta_json = get_string_from_scope(vm, &scope, "__rlm_state_delta_payload");
-                let deleted_json = get_string_from_scope(vm, &scope, "__rlm_state_deleted_payload");
-                let fallback_flag = get_string_from_scope(vm, &scope, "__rlm_state_sync_fallback");
-                Ok((delta_json, deleted_json, fallback_flag))
-            })
+            .enter(
+                |vm: &vm::VirtualMachine| -> vm::PyResult<(String, String, String)> {
+                    let sync_code =
+                        "import json\n__rlm_state_sync_fallback = '0'\nif '__rlm_TrackingDict' in \
+                         globals() and isinstance(state, __rlm_TrackingDict):\n    \
+                         __rlm_state_delta_payload = json.dumps({key: state.get(key) for key in \
+                         __rlm_state_dirty_keys})\n    __rlm_state_deleted_payload = \
+                         json.dumps(list(__rlm_state_deleted_keys))\n    \
+                         __rlm_state_dirty_keys.clear()\n    \
+                         __rlm_state_deleted_keys.clear()\nelse:\n    __rlm_state_sync_fallback = \
+                         '1'\n    __rlm_state_delta_payload = '{}'\n    \
+                         __rlm_state_deleted_payload = '[]'\n";
+                    vm.run_string(scope.clone(), sync_code, "<rlm_state_sync>".to_owned())?;
+                    let delta_json = get_string_from_scope(vm, &scope, "__rlm_state_delta_payload");
+                    let deleted_json =
+                        get_string_from_scope(vm, &scope, "__rlm_state_deleted_payload");
+                    let fallback_flag =
+                        get_string_from_scope(vm, &scope, "__rlm_state_sync_fallback");
+                    Ok((delta_json, deleted_json, fallback_flag))
+                },
+            )
             .map_err(|err: vm::PyRef<PyBaseException>| {
                 anyhow::anyhow!(
                     "shared state sync error (values must be JSON serializable): {err:?}"
@@ -809,14 +844,21 @@ def llm_query(prompts):
     fn sync_shared_state_full(&self, scope: &Scope) -> anyhow::Result<()> {
         let (state_json, deleted_json) = self
             .interpreter
-            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
-                let sync_code = "import json\n__rlm_state_sync_payload = json.dumps(state)\n__rlm_state_deleted_payload = json.dumps(list(__rlm_state_deleted_keys))\nif '__rlm_state_dirty_keys' in globals():\n    __rlm_state_dirty_keys.clear()\n__rlm_state_deleted_keys.clear()\n";
-                vm.run_string(scope.clone(), sync_code, "<rlm_state_sync_full>".to_owned())?;
-                let state_json = get_string_from_scope(vm, scope, "__rlm_state_sync_payload");
-                let deleted_json =
-                    get_string_from_scope(vm, scope, "__rlm_state_deleted_payload");
-                Ok((state_json, deleted_json))
-            })
+            .enter(
+                |vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
+                    let sync_code = "import json\n__rlm_state_sync_payload = \
+                                     json.dumps(state)\n__rlm_state_deleted_payload = \
+                                     json.dumps(list(__rlm_state_deleted_keys))\nif \
+                                     '__rlm_state_dirty_keys' in globals():\n    \
+                                     __rlm_state_dirty_keys.clear()\n__rlm_state_deleted_keys.\
+                                     clear()\n";
+                    vm.run_string(scope.clone(), sync_code, "<rlm_state_sync_full>".to_owned())?;
+                    let state_json = get_string_from_scope(vm, scope, "__rlm_state_sync_payload");
+                    let deleted_json =
+                        get_string_from_scope(vm, scope, "__rlm_state_deleted_payload");
+                    Ok((state_json, deleted_json))
+                },
+            )
             .map_err(|err: vm::PyRef<PyBaseException>| {
                 anyhow::anyhow!(
                     "shared state full sync error (values must be JSON serializable): {err:?}"
@@ -1122,12 +1164,14 @@ fn validate_subcall_messages(messages: &[Message]) -> Result<(), String> {
     let total_tokens_approx = estimate_tokens(total_chars);
     if total_chars > MAX_SUBCALL_TOTAL_CHARS {
         return Err(format!(
-            "sub-query too large ({total_chars} chars > {MAX_SUBCALL_TOTAL_CHARS}). Chunk the context before calling llm_query."
+            "sub-query too large ({total_chars} chars > {MAX_SUBCALL_TOTAL_CHARS}). Chunk the \
+             context before calling llm_query."
         ));
     }
     if total_tokens_approx > MAX_SUBCALL_TOTAL_TOKENS_APPROX {
         return Err(format!(
-            "sub-query too large (~{total_tokens_approx} tokens > {MAX_SUBCALL_TOTAL_TOKENS_APPROX}). Chunk the context before calling llm_query."
+            "sub-query too large (~{total_tokens_approx} tokens > \
+             {MAX_SUBCALL_TOTAL_TOKENS_APPROX}). Chunk the context before calling llm_query."
         ));
     }
     if let Some(oversized) = messages
@@ -1137,7 +1181,8 @@ fn validate_subcall_messages(messages: &[Message]) -> Result<(), String> {
         .filter(|len| *len > MAX_SUBCALL_MESSAGE_CHARS)
     {
         return Err(format!(
-            "single sub-query message too large ({oversized} chars > {MAX_SUBCALL_MESSAGE_CHARS}). Chunk the context before calling llm_query."
+            "single sub-query message too large ({oversized} chars > \
+             {MAX_SUBCALL_MESSAGE_CHARS}). Chunk the context before calling llm_query."
         ));
     }
     if let Some(oversized_tokens) = messages
@@ -1147,7 +1192,8 @@ fn validate_subcall_messages(messages: &[Message]) -> Result<(), String> {
         .filter(|tokens| *tokens > MAX_SUBCALL_MESSAGE_TOKENS_APPROX)
     {
         return Err(format!(
-            "single sub-query message too large (~{oversized_tokens} tokens > {MAX_SUBCALL_MESSAGE_TOKENS_APPROX}). Chunk the context before calling llm_query."
+            "single sub-query message too large (~{oversized_tokens} tokens > \
+             {MAX_SUBCALL_MESSAGE_TOKENS_APPROX}). Chunk the context before calling llm_query."
         ));
     }
     Ok(())

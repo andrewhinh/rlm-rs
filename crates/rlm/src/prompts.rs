@@ -1,6 +1,7 @@
 use crate::llm::Message;
 
-pub const DEFAULT_QUERY: &str = "Please read through the context and answer any queries or respond to any instructions contained within it.";
+pub const DEFAULT_QUERY: &str = "Please read through the context and answer any queries or \
+                                 respond to any instructions contained within it.";
 
 pub const REPL_SYSTEM_PROMPT: &str = r#"You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a REPL environment that can recursively query sub-LLMs. Use sub-queries only when they help; avoid exhaustive or repetitive sub-calls. You will be queried iteratively until you provide a final answer.
 
@@ -46,7 +47,11 @@ IMPORTANT: When you are done with the iterative process, you MUST provide a fina
 Think step by step carefully, plan, and execute this plan immediately in your response -- do not just say "I will do this" or "I will do that". Use the REPL environment and sub-queries when they add value, and avoid unbounded loops. Remember to explicitly answer the original query in your final answer.
 "#;
 
-const USER_PROMPT: &str = "Think step-by-step on what to do using the REPL environment (which contains the context) to answer the original query: \"{query}\".\n\nUse the REPL environment and sub-LLM queries only as needed, avoid exhaustive loops, and stop once you have enough information. Your next action:";
+const USER_PROMPT: &str = "Think step-by-step on what to do using the REPL environment (which \
+                           contains the context) to answer the original query: \
+                           \"{query}\".\n\nUse the REPL environment and sub-LLM queries only as \
+                           needed, avoid exhaustive loops, and stop once you have enough \
+                           information. Your next action:";
 
 pub fn build_system_prompt() -> Vec<Message> {
     vec![Message::system(REPL_SYSTEM_PROMPT)]
@@ -59,7 +64,9 @@ pub fn next_action_prompt(query: &str, iteration: usize, final_answer: bool) -> 
         );
     }
     if iteration == 0 {
-        let safeguard = "You have not interacted with the REPL environment or seen your context yet. Your next action should be to look through, don't just provide a final answer yet.\n\n";
+        let safeguard = "You have not interacted with the REPL environment or seen your context \
+                         yet. Your next action should be to look through, don't just provide a \
+                         final answer yet.\n\n";
         return Message::user(format!(
             "{safeguard}{}",
             USER_PROMPT.replace("{query}", query)

@@ -18,7 +18,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt
 
       - run: cargo fmt -- --check
@@ -32,7 +32,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: nightly
           components: clippy, rust-src
 
       - uses: Swatinem/rust-cache@v2

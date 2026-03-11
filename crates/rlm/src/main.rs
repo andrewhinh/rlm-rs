@@ -1,6 +1,6 @@
-use rand::Rng;
 use std::time::Instant;
 
+use rand::Rng;
 use rlm::rlm::{RlmConfig, RlmRepl};
 
 #[cfg(feature = "mimalloc")]

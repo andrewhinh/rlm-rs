@@ -53,7 +53,8 @@ fn resolve_worker_bin() -> Result<std::path::PathBuf, String> {
     }
     if !worker.exists() {
         return Err(format!(
-            "sandbox worker binary not found at {}. Build it with `cargo build -p app --bin sandbox_worker`",
+            "sandbox worker binary not found at {}. Build it with `cargo build -p app --bin \
+             sandbox_worker`",
             worker.display()
         ));
     }
