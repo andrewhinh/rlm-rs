@@ -1,6 +1,6 @@
 # rlm-rs
 
-RLMs in Rust using RustPython and gVisor
+RLMs in Rust using RustPython and gVisor.
 
 ![icon](./assets/icon.png)
 
