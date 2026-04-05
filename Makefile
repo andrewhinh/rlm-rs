@@ -2,9 +2,10 @@
 
 ARG := $(word 2,$(MAKECMDGOALS))
 HOST ?=
+METHOD ?= rlm
 
 help:
-	@echo "app        run app"
+	@echo "app        run app with METHOD=rlm|lambda_rlm"
 	@echo "goose      run goose against <host>"
 	@echo "conn       connect to instance <instance-id>"
 	@echo "create     create instance"
@@ -18,7 +19,7 @@ help:
 
 app:
 	cargo build -p app --bin sandbox_worker
-	cargo run -p app
+	RLM_METHOD="$(METHOD)" cargo run -p app
 
 goose:
 	@if [ -z "$(HOST)" ]; then echo "usage: make goose HOST=<host>"; exit 1; fi

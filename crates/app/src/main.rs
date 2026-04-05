@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use app::env as app_env;
 use app::launcher::build_launcher;
 use app::session::{
     SessionConfig, SessionError, SessionErrorKind, SessionManagerHandle, SessionRequest,
@@ -15,7 +16,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use rlm::lambda_rlm::LambdaOptions;
 use rlm::prompts::DEFAULT_QUERY;
+use rlm::rlm::RlmMethod;
+use rlm::utils::split_embedded_context_question;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -32,7 +36,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Clone)]
 struct AppConfig {
     api_key: String,
+    method: RlmMethod,
+    base_url: String,
     model: String,
+    recursive_model: String,
+    max_iterations: usize,
+    depth: usize,
+    enable_logging: bool,
+    disable_recursive: bool,
+    lambda_options: LambdaOptions,
     max_sessions: usize,
     max_inflight: usize,
     ingress_capacity: usize,
@@ -52,7 +64,16 @@ const MAX_LLM_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
 impl AppConfig {
     fn to_worker_config(&self) -> SandboxWorkerConfig {
         SandboxWorkerConfig {
+            method: self.method,
             api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            recursive_model: self.recursive_model.clone(),
+            max_iterations: self.max_iterations,
+            depth: self.depth,
+            enable_logging: self.enable_logging,
+            disable_recursive: self.disable_recursive,
+            lambda_options: self.lambda_options.clone(),
         }
     }
 
@@ -160,6 +181,7 @@ async fn openai_chat_completions_handler(
         stream,
         reset,
     } = payload;
+
     if stream.unwrap_or(false) {
         return openai_error_response(
             StatusCode::BAD_REQUEST,
@@ -206,9 +228,15 @@ async fn openai_chat_completions_handler(
         openai_query_from_messages(&messages),
         Some(openai_context_from_messages(messages)),
     );
+    let request_id = Uuid::new_v4().simple().to_string();
+    println!(
+        "session_dispatch request_id={} session_id={} reset={}",
+        request_id, session_id, reset
+    );
 
     let (respond_to, response_rx) = oneshot::channel();
     if let Err(err) = state.sessions.try_dispatch(SessionRequest {
+        request_id,
         session_id: session_id.clone(),
         reset,
         query,
@@ -320,6 +348,19 @@ fn validate_openai_input(messages: &[OpenAiChatMessage]) -> Result<(), (StatusCo
                 ),
             ));
         }
+        if message.role == "user"
+            && let Value::String(text) = &message.content
+            && text.trim().starts_with("Context:\n")
+            && split_embedded_context_question(text).is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "messages[{idx}].content must match \
+                     `Context:\\n<context>\\n\\nQuestion:\\n<query>`"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -425,6 +466,9 @@ fn openai_query_from_messages(messages: &[OpenAiChatMessage]) -> String {
     for message in messages.iter().rev() {
         if message.role == "user" {
             let content = openai_message_text(message);
+            if let Some((_, question)) = split_embedded_context_question(&content) {
+                return question.to_owned();
+            }
             if !content.is_empty() {
                 return content.into_owned();
             }
@@ -439,13 +483,33 @@ fn openai_query_from_messages(messages: &[OpenAiChatMessage]) -> String {
 }
 
 fn openai_context_from_messages(messages: Vec<OpenAiChatMessage>) -> Value {
+    let cleaned: Vec<(String, Value)> = messages
+        .into_iter()
+        .map(|message| {
+            let content = match message.content {
+                Value::String(text) => split_embedded_context_question(&text)
+                    .map(|(context, _)| Value::String(context.to_owned()))
+                    .unwrap_or(Value::String(text)),
+                other => other,
+            };
+            (message.role, content)
+        })
+        .collect();
+
+    if cleaned.len() == 1
+        && cleaned[0].0 == "user"
+        && let Value::String(text) = &cleaned[0].1
+    {
+        return Value::String(text.clone());
+    }
+
     Value::Array(
-        messages
+        cleaned
             .into_iter()
-            .map(|message| {
+            .map(|(role, content)| {
                 let mut object = serde_json::Map::new();
-                object.insert("role".to_owned(), Value::String(message.role));
-                object.insert("content".to_owned(), message.content);
+                object.insert("role".to_owned(), Value::String(role));
+                object.insert("content".to_owned(), content);
                 Value::Object(object)
             })
             .collect(),
@@ -456,9 +520,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key =
         env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for the RLM server")?;
+    let lambda_defaults = LambdaOptions::default();
     let config = AppConfig {
         api_key,
-        model: "gpt-5".to_owned(),
+        method: app_env::method("RLM_METHOD", RlmMethod::Rlm)?,
+        base_url: app_env::string("RLM_BASE_URL", "https://api.openai.com/v1"),
+        model: app_env::string("RLM_MODEL", "gpt-5"),
+        recursive_model: app_env::string("RLM_RECURSIVE_MODEL", "gpt-5-nano"),
+        max_iterations: app_env::usize("RLM_MAX_ITERATIONS", 10)?,
+        depth: app_env::usize("RLM_DEPTH", 0)?,
+        enable_logging: app_env::bool("RLM_ENABLE_LOGGING", false)?,
+        disable_recursive: app_env::bool("RLM_DISABLE_RECURSIVE", false)?,
+        lambda_options: app_env::lambda_options(&lambda_defaults)?,
         max_sessions: DEFAULT_MAX_SESSIONS,
         max_inflight: DEFAULT_MAX_INFLIGHT,
         ingress_capacity: DEFAULT_INGRESS_CAPACITY,

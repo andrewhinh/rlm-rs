@@ -1,3 +1,4 @@
+pub mod lambda_rlm;
 pub mod llm;
 pub mod logger;
 pub mod prompts;

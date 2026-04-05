@@ -95,6 +95,14 @@ impl Logger {
         println!();
     }
 
+    pub fn log_lambda_phase(&self, phase: &str, detail: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!("LAMBDA PHASE [{}]: {}", phase, truncate(detail, 500));
+        println!();
+    }
+
     pub fn log_final_response(&self, response: &str) {
         if !self.enabled {
             return;

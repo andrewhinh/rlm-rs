@@ -56,6 +56,7 @@ impl From<Value> for ContextInput {
 pub struct ContextData {
     pub json: Option<Value>,
     pub text: Option<String>,
+    pub full_text: Option<String>,
 }
 
 pub fn context_from_value(value: Option<Value>) -> ContextInput {
@@ -75,27 +76,72 @@ pub fn context_from_value(value: Option<Value>) -> ContextInput {
     }
 }
 
-pub fn convert_context_for_repl(context: ContextInput) -> ContextData {
+pub fn split_embedded_context_question(text: &str) -> Option<(&str, &str)> {
+    let body = text.trim().strip_prefix("Context:\n")?;
+    let (context, question) = body.split_once("\n\nQuestion:\n")?;
+    let context = context.trim();
+    let question = question.trim();
+    (!context.is_empty() && !question.is_empty()).then_some((context, question))
+}
+
+pub fn convert_context_for_repl(context: ContextInput, query: &str) -> ContextData {
     match context {
         ContextInput::Json(value) => ContextData {
             json: Some(normalize_context_json(value)),
             text: None,
+            full_text: None,
         },
-        ContextInput::Text(value) => ContextData {
-            json: None,
-            text: Some(value),
-        },
+        ContextInput::Text(value) => build_text_context(value, query),
         ContextInput::Messages(messages) => {
             let items: Vec<String> = messages.into_iter().map(|msg| msg.content).collect();
             ContextData {
                 json: Some(Value::Array(items.into_iter().map(Value::String).collect())),
                 text: None,
+                full_text: None,
             }
         }
         ContextInput::Strings(items) => ContextData {
             json: Some(Value::Array(items.into_iter().map(Value::String).collect())),
             text: None,
+            full_text: None,
         },
+    }
+}
+
+fn build_text_context(value: String, query: &str) -> ContextData {
+    let excerpt = retrieve_relevant_text(&value, query);
+    let full_text = (excerpt != value).then_some(value);
+    ContextData {
+        json: None,
+        text: Some(excerpt),
+        full_text,
+    }
+}
+
+pub fn stringify_context_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => {
+            if let Some(strings) = array_to_strings(items) {
+                return strings.join("\n\n");
+            }
+            if let Some(messages) = array_to_messages(items) {
+                return messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+            }
+            items
+                .iter()
+                .map(|item| match item {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+        other => other.to_string(),
     }
 }
 
@@ -163,6 +209,142 @@ fn normalize_context_json(value: Value) -> Value {
         }
         other => other,
     }
+}
+
+const MIN_RETRIEVAL_CONTEXT_CHARS: usize = 8_192;
+const MAX_RETRIEVAL_EXCERPT_CHARS: usize = 12_000;
+const LINE_WINDOW_RADIUS: usize = 2;
+const MAX_LINE_SPANS: usize = 8;
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "any", "are", "be", "by", "can", "do", "for", "from", "how", "i", "in", "is",
+    "it", "looking", "of", "on", "or", "please", "read", "respond", "the", "through", "to", "what",
+    "with", "you", "your",
+];
+
+fn retrieve_relevant_text(text: &str, query: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= MIN_RETRIEVAL_CONTEXT_CHARS {
+        return trimmed.to_owned();
+    }
+
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return trimmed.to_owned();
+    }
+
+    let excerpt = retrieve_relevant_lines(trimmed, &terms).unwrap_or_else(|| trimmed.to_owned());
+
+    if excerpt.trim().is_empty() {
+        trimmed.to_owned()
+    } else {
+        excerpt
+    }
+}
+
+fn retrieve_relevant_lines(text: &str, terms: &[String]) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 4 {
+        return None;
+    }
+
+    let mut scored = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let score = match_count(line, terms);
+        if score > 0 {
+            scored.push((score, idx));
+        }
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by(|left, right| right.cmp(left));
+
+    let mut spans = Vec::new();
+    for &(_, idx) in scored.iter().take(MAX_LINE_SPANS) {
+        let start = idx.saturating_sub(LINE_WINDOW_RADIUS);
+        let end = (idx + LINE_WINDOW_RADIUS + 1).min(lines.len());
+        spans.push((start, end));
+    }
+
+    let excerpt = join_line_spans(&lines, &merge_spans(spans), MAX_RETRIEVAL_EXCERPT_CHARS);
+    (!excerpt.trim().is_empty()).then_some(excerpt)
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for token in query.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let token = token.trim().to_ascii_lowercase();
+        if token.len() < 2 || STOPWORDS.contains(&token.as_str()) || terms.contains(&token) {
+            continue;
+        }
+        terms.push(token);
+    }
+    terms
+}
+
+fn match_count(text: &str, terms: &[String]) -> usize {
+    let lower = text.to_ascii_lowercase();
+    terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .count()
+}
+
+fn merge_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if spans.is_empty() {
+        return spans;
+    }
+    spans.sort_unstable();
+    let mut merged = vec![spans[0]];
+    for (start, end) in spans.into_iter().skip(1) {
+        let last = merged.last_mut().expect("merged has at least one span");
+        if start <= last.1 {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn join_line_spans(lines: &[&str], spans: &[(usize, usize)], max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut out_chars = 0;
+    for (idx, (start, end)) in spans.iter().enumerate() {
+        let separator = (idx > 0 && !out.is_empty()).then_some("\n...\n");
+        let separator_chars = separator.map_or(0, char_count);
+        let segment = lines[*start..*end].join("\n");
+        let segment_chars = char_count(&segment);
+        if out_chars + separator_chars + segment_chars > max_chars {
+            if let Some(separator) = separator
+                && out_chars + separator_chars <= max_chars
+            {
+                out.push_str(separator);
+                out_chars += separator_chars;
+            }
+            let remaining = max_chars.saturating_sub(out_chars);
+            if remaining > 0 {
+                let truncated = truncate_text(&segment, remaining);
+                out.push_str(&truncated);
+            }
+            break;
+        }
+        if let Some(separator) = separator {
+            out.push_str(separator);
+            out_chars += separator_chars;
+        }
+        out.push_str(&segment);
+        out_chars += segment_chars;
+    }
+    out
+}
+
+fn char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 pub fn find_code_blocks(text: &str) -> Vec<String> {
@@ -367,5 +549,30 @@ pub async fn check_for_final_answer(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{char_count, join_line_spans, split_embedded_context_question};
+
+    #[test]
+    fn join_line_spans_respects_unicode_char_limit() {
+        let lines = ["alpha", "beta", "piñata", "omega"];
+        let excerpt = join_line_spans(&lines, &[(1, 4)], 7);
+        assert_eq!(excerpt, "beta\npi");
+        assert_eq!(char_count(&excerpt), 7);
+    }
+
+    #[test]
+    fn split_embedded_context_question_requires_goose_form() {
+        assert_eq!(
+            split_embedded_context_question("Context:\nctx\n\nQuestion:\nwhat?"),
+            Some(("ctx", "what?"))
+        );
+        assert_eq!(
+            split_embedded_context_question("Context:\nctx\nQuestion:\nwhat?"),
+            None
+        );
     }
 }

@@ -20,6 +20,7 @@ pub struct SandboxRunResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRequest {
     Ping,
+    Reset,
     Run(SandboxRunRequest),
     Shutdown,
 }

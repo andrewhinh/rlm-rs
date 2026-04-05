@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use rand::Rng;
-use rlm::rlm::{RlmConfig, RlmRepl};
+use rlm::lambda_rlm::LambdaOptions;
+use rlm::rlm::{RlmConfig, RlmMethod, RlmRepl};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -39,6 +40,10 @@ fn generate_massive_context(num_lines: usize, answer: &str) -> String {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    let method = std::env::var("RLM_METHOD")
+        .map(|value| value.parse())
+        .unwrap_or(Ok(RlmMethod::Rlm))
+        .map_err(|err: String| anyhow::anyhow!(err))?;
 
     println!("Example of using RLM (REPL) with GPT-5-nano on a needle-in-haystack problem.");
     let answer: String = rand::rng().random_range(1_000_000..9_999_999).to_string();
@@ -49,10 +54,12 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let config = RlmConfig {
+        method,
         api_key: Some(std::env::var("OPENAI_API_KEY")?),
         base_url: "https://api.openai.com/v1".to_owned(),
         model: "gpt-5".to_owned(),
         recursive_model: "gpt-5-nano".to_owned(),
+        lambda_options: LambdaOptions::default(),
         depth: 0,
         enable_logging: true,
         max_iterations: 10,

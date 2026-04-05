@@ -2,19 +2,48 @@
 set -euo pipefail
 
 INSTANCE_ID=""
+REMOTE_CMD=""
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 
-if [[ $# -gt 1 ]]; then
-  echo "Usage: $(basename "$0") [instance-id]"
-  exit 1
-fi
+usage() {
+  echo "Usage: $(basename "$0") [options] [instance-id]"
+  echo ""
+  echo "Options:"
+  echo "  --cmd <command>   Command to run non-interactively"
+  echo "  -h, --help        Show this help message"
+}
 
-if [[ $# -eq 1 ]]; then
-  if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Usage: $(basename "$0") [instance-id]"
-    exit 0
-  fi
-  INSTANCE_ID="$1"
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --cmd)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --cmd requires an argument"
+        exit 1
+      fi
+      REMOTE_CMD="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    *)
+      if [[ -z "${INSTANCE_ID}" ]]; then
+        INSTANCE_ID="$1"
+      else
+        echo "Error: Too many arguments"
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
 
 REGION=$(aws configure get region)
 
@@ -95,6 +124,40 @@ fi
 
 PUBLIC_IP="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
-rsync -av -e "ssh -i rlm-rs.pem" --exclude target --exclude .git . ubuntu@"$PUBLIC_IP":~/rlm-rs
+rsync -av --delete -e "ssh ${SSH_OPTS[*]} -i rlm-rs.pem" --exclude target --exclude .git . ubuntu@"$PUBLIC_IP":~/rlm-rs
 
-ssh -i rlm-rs.pem ubuntu@"$PUBLIC_IP" -t 'sudo usermod -aG docker "$USER" && newgrp docker && docker ps && sudo chown -R "$USER":"$USER" ~/rlm-rs/target && chmod -R u+rwX ~/rlm-rs/target; exec bash -l'
+if [[ -n "${REMOTE_CMD}" ]]; then
+  ssh "${SSH_OPTS[@]}" -i rlm-rs.pem ubuntu@"$PUBLIC_IP" bash -s -- "$REMOTE_CMD" << 'REMOTE_SCRIPT'
+set -euo pipefail
+REMOTE_CMD="$1"
+REMOTE_CMD_PATH="$(mktemp /tmp/rlm-rs-cmd.XXXXXX.sh)"
+trap 'rm -f "$REMOTE_CMD_PATH"' EXIT
+cat > "$REMOTE_CMD_PATH" << 'REMOTE_CMD_HEADER'
+#!/usr/bin/env bash
+set -euo pipefail
+REMOTE_CMD_HEADER
+printf '%s\n' "$REMOTE_CMD" >> "$REMOTE_CMD_PATH"
+chmod 700 "$REMOTE_CMD_PATH"
+sudo usermod -aG docker "$USER"
+sudo chown -R "$USER":"$USER" ~/rlm-rs/target 2>/dev/null || true
+chmod -R u+rwX ~/rlm-rs/target 2>/dev/null || true
+cd ~/rlm-rs
+if command -v sg >/dev/null 2>&1; then
+  sg docker -c "cd ~/rlm-rs && bash -lc $REMOTE_CMD_PATH"
+else
+  bash -lc "$REMOTE_CMD_PATH"
+fi
+REMOTE_SCRIPT
+else
+  ssh "${SSH_OPTS[@]}" -i rlm-rs.pem ubuntu@"$PUBLIC_IP" -t bash -s << 'REMOTE_SCRIPT'
+sudo usermod -aG docker "$USER"
+sudo chown -R "$USER":"$USER" ~/rlm-rs/target 2>/dev/null || true
+chmod -R u+rwX ~/rlm-rs/target 2>/dev/null || true
+cd ~/rlm-rs
+if command -v sg >/dev/null 2>&1; then
+  exec sg docker -c 'cd ~/rlm-rs && docker ps && exec bash -l'
+fi
+docker ps
+exec bash -l
+REMOTE_SCRIPT
+fi

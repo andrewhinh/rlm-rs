@@ -1,11 +1,12 @@
 use std::env;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use crate::client::SandboxClient;
-use crate::{SandboxHandle, SandboxLaunchConfig, SandboxLauncher};
+use crate::{SandboxHandle, SandboxLaunchConfig, SandboxLauncher, SharedSandboxLauncher};
 
-pub fn build_launcher(config: SandboxLaunchConfig) -> Box<dyn SandboxLauncher> {
-    Box::new(DockerRunscLauncher { config })
+pub fn build_launcher(config: SandboxLaunchConfig) -> SharedSandboxLauncher {
+    Arc::new(DockerRunscLauncher { config })
 }
 
 struct DockerRunscLauncher {
@@ -62,7 +63,57 @@ fn resolve_worker_bin() -> Result<std::path::PathBuf, String> {
 }
 
 fn apply_worker_env_args(command: &mut Command, config: &SandboxLaunchConfig) {
-    command
-        .arg("-e")
-        .arg(format!("OPENAI_API_KEY={}", config.worker.api_key));
+    add_env_arg(command, "RLM_METHOD", config.worker.method.as_str());
+    add_env_arg(command, "OPENAI_API_KEY", &config.worker.api_key);
+    add_env_arg(command, "RLM_BASE_URL", &config.worker.base_url);
+    add_env_arg(command, "RLM_MODEL", &config.worker.model);
+    add_env_arg(
+        command,
+        "RLM_RECURSIVE_MODEL",
+        &config.worker.recursive_model,
+    );
+    add_env_arg(
+        command,
+        "RLM_MAX_ITERATIONS",
+        &config.worker.max_iterations.to_string(),
+    );
+    add_env_arg(command, "RLM_DEPTH", &config.worker.depth.to_string());
+    add_env_arg(
+        command,
+        "RLM_ENABLE_LOGGING",
+        &config.worker.enable_logging.to_string(),
+    );
+    add_env_arg(
+        command,
+        "RLM_DISABLE_RECURSIVE",
+        &config.worker.disable_recursive.to_string(),
+    );
+    add_env_arg(
+        command,
+        "RLM_LAMBDA_CONTEXT_WINDOW_CHARS",
+        &config
+            .worker
+            .lambda_options
+            .context_window_chars
+            .to_string(),
+    );
+    add_env_arg(
+        command,
+        "RLM_LAMBDA_ACCURACY_TARGET",
+        &config.worker.lambda_options.accuracy_target.to_string(),
+    );
+    add_env_arg(
+        command,
+        "RLM_LAMBDA_LEAF_ACCURACY",
+        &config.worker.lambda_options.a_leaf.to_string(),
+    );
+    add_env_arg(
+        command,
+        "RLM_LAMBDA_COMPOSE_ACCURACY",
+        &config.worker.lambda_options.a_compose.to_string(),
+    );
+}
+
+fn add_env_arg(command: &mut Command, name: &str, value: &str) {
+    command.arg("-e").arg(format!("{name}={value}"));
 }
