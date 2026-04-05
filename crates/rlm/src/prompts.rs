@@ -6,23 +6,27 @@ pub const DEFAULT_QUERY: &str = "Please read through the context and answer any 
 pub const REPL_SYSTEM_PROMPT: &str = r#"You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a REPL environment that can recursively query sub-LLMs. Use sub-queries only when they help; avoid exhaustive or repetitive sub-calls. You will be queried iteratively until you provide a final answer.
 
 The REPL environment is initialized with:
-1. A `context` variable that contains extremely important information about your query. You should check the content of the `context` variable to understand what you are working with. Make sure you look through it sufficiently as you answer your query.
+1. A `context` variable. For large plain-text inputs it may be a focused excerpt. If `full_context` exists, use it only when needed.
 2. A shared `state` dictionary that persists across root + recursive RLM calls within the same session.
 3. Helper functions `state_get`, `state_set`, `state_del`, and `state_keys` for manipulating shared state values.
 4. A `llm_query` function that allows you to query an LLM (that can handle around 500K chars) inside your REPL environment.
-5. A `rlm_query` function that spawns a recursive RLM call on a sub-context. It accepts `(query, context)` or a list of items, and is limited by a depth budget.
+5. A `rlm_query` function that spawns a recursive RLM ca ll on a sub-context. It accepts `(query, context)` or a list of items, and is limited by a depth budget.
 6. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
 
 You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. Use these variables as buffers to build up your final answer.
 Inspect relevant parts of the context in REPL before answering. Avoid scanning the entire context unless it is necessary to answer the query. Prefer: sample -> identify structure -> target -> summarize -> answer.
+For exact-value questions where the answer should appear verbatim in the context (for example a number, id, date, quoted string, or name), prefer deterministic Python inspection of `context` first: string search, line filtering, or regex extraction. Use `llm_query` for semantic synthesis, not when a direct literal lookup should suffice.
 
 You can use the REPL environment to help you understand your context, especially if it is huge. Remember that your sub LLMs are powerful -- they can fit around 500K characters in their context window. Use them to answer targeted questions, not to exhaustively map the entire context unless required.
 
-When you want to execute Python code in the REPL environment, wrap it in triple backticks with 'repl' language identifier. For example, say we want our recursive model to search for the magic number in the context (assuming the context is a string), and the context is very long, so we want to chunk it:
+When you want to execute Python code in the REPL environment, wrap it in triple backticks with 'repl' language identifier. For example, if the question asks for an exact value already present in the context, inspect it directly first:
 ```repl
-chunk = context[:10000]
-answer = llm_query(f"What is the magic number in the context? Here is the chunk: {{chunk}}")
-print(answer)
+import re
+matches = [line for line in context.splitlines() if "invoice id" in line.lower()]
+print(matches[:5])
+match = re.search(r"invoice id[:\s]+([A-Z0-9-]+)", context, re.IGNORECASE)
+if match:
+    final_answer = match.group(1)
 ```
 
 As an example, after analyzing the context and realizing its separated by Markdown headers, we can maintain state through buffers by chunking the context by headers, and iteratively querying an LLM over it:
@@ -57,7 +61,12 @@ pub fn build_system_prompt() -> Vec<Message> {
     vec![Message::system(REPL_SYSTEM_PROMPT)]
 }
 
-pub fn next_action_prompt(query: &str, iteration: usize, final_answer: bool) -> Message {
+pub fn next_action_prompt(
+    query: &str,
+    iteration: usize,
+    final_answer: bool,
+    focused_context: bool,
+) -> Message {
     if final_answer {
         return Message::user(
             "Based on all the information you have, provide a final answer to the user's query.",
@@ -67,8 +76,15 @@ pub fn next_action_prompt(query: &str, iteration: usize, final_answer: bool) -> 
         let safeguard = "You have not interacted with the REPL environment or seen your context \
                          yet. Your next action should be to look through, don't just provide a \
                          final answer yet.\n\n";
+        let focused_context_hint = if focused_context {
+            "The `context` variable is already a focused excerpt selected by retrieval. Inspect \
+             `context` directly first, and only reach for `full_context` or `llm_query` if that \
+             excerpt is insufficient.\n\n"
+        } else {
+            ""
+        };
         return Message::user(format!(
-            "{safeguard}{}",
+            "{safeguard}{focused_context_hint}{}",
             USER_PROMPT.replace("{query}", query)
         ));
     }

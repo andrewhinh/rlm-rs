@@ -55,8 +55,8 @@ Run `make help` for the full list of commands.
 For both Linux and EC2 instances:
 
 ```bash
-cargo run
-make app
+RLM_METHOD=<rlm|lambda_rlm> cargo run
+make app METHOD=<rlm|lambda_rlm>
 make goose HOST=<host>
 ```
 
@@ -67,6 +67,7 @@ make goose HOST=<host>
 - [x] add support for depth > 1
 - [x] add [shared program state](https://elliecheng.com/blog/2026/01/20/enabling-rlm-with-shared-program-state/)
 - [x] add per-session REPL sandboxing with gVisor
+- [x] add toggle for λ-RLM [paper](https://arxiv.org/pdf/2603.20105) and [code](https://github.com/lambda-calculus-LLM/lambda-RLM)
 
 ## Details
 

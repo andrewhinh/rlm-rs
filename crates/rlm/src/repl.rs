@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use rustpython_pylib;
 use rustpython_stdlib;
 use rustpython_vm as vm;
-use rustpython_vm::builtins::{PyBaseException, PyDictRef};
+use rustpython_vm::AsObject;
+use rustpython_vm::builtins::{
+    PyBaseException, PyDict, PyDictRef, PyFloat, PyList, PySet, PyTuple,
+};
 use rustpython_vm::scope::Scope;
 use rustpython_vm::{Interpreter, InterpreterBuilder};
 use serde::Deserialize;
@@ -152,6 +155,9 @@ enum ReplCommand {
         name: String,
         response: oneshot::Sender<anyhow::Result<Option<String>>>,
     },
+    ExportContext {
+        response: oneshot::Sender<anyhow::Result<Value>>,
+    },
     Reset {
         response: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -243,6 +249,7 @@ impl ReplEnv {
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
         let mut json_path: Option<String> = None;
         let mut text_path: Option<String> = None;
+        let mut full_text_path: Option<String> = None;
 
         if let Some(json_value) = context.json {
             let path = temp_dir.join("context.json");
@@ -255,6 +262,11 @@ impl ReplEnv {
             let path = temp_dir.join("context.txt");
             fs::write(&path, text)?;
             text_path = Some(path.to_string_lossy().to_string());
+        }
+        if let Some(full_text) = context.full_text {
+            let path = temp_dir.join("full_context.txt");
+            fs::write(&path, full_text)?;
+            full_text_path = Some(path.to_string_lossy().to_string());
         }
 
         self.interpreter
@@ -421,32 +433,66 @@ def __rlm_safe_open(path, *args, _import=__rlm_import_builtin, _open=__rlm_open_
                     "state_init",
                     r#"import json
 __name__ = '__main__'
-__rlm_state_deleted_keys = set()
-__rlm_state_dirty_keys = set()
+_rlm_state_deleted_keys = set()
+_rlm_state_dirty_keys = set()
+
+def _rlm_make_json_safe(value, seen=None):
+    if seen is None:
+        seen = set()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    value_id = id(value)
+    if value_id in seen:
+        return "<recursive>"
+    if isinstance(value, dict):
+        seen.add(value_id)
+        result = {}
+        for key, item in value.items():
+            result[str(key)] = _rlm_make_json_safe(item, seen)
+        seen.discard(value_id)
+        return result
+    if isinstance(value, (list, tuple)):
+        seen.add(value_id)
+        result = [_rlm_make_json_safe(item, seen) for item in value]
+        seen.discard(value_id)
+        return result
+    if isinstance(value, set):
+        seen.add(value_id)
+        result = [_rlm_make_json_safe(item, seen) for item in value]
+        seen.discard(value_id)
+        return result
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        try:
+            return repr(value)
+        except Exception:
+            return f"<non_serializable {type(value).__name__}>"
 
 class __rlm_TrackingDict(dict):
     def __setitem__(self, key, value):
         key = str(key)
-        __rlm_state_deleted_keys.discard(key)
-        __rlm_state_dirty_keys.add(key)
-        return super().__setitem__(key, value)
+        _rlm_state_deleted_keys.discard(key)
+        _rlm_state_dirty_keys.add(key)
+        return super().__setitem__(key, _rlm_make_json_safe(value))
 
     def __delitem__(self, key):
         key = str(key)
-        __rlm_state_dirty_keys.discard(key)
-        __rlm_state_deleted_keys.add(key)
+        _rlm_state_dirty_keys.discard(key)
+        _rlm_state_deleted_keys.add(key)
         return super().__delitem__(key)
 
     def pop(self, key, default=None):
         key = str(key)
-        __rlm_state_dirty_keys.discard(key)
-        __rlm_state_deleted_keys.add(key)
+        _rlm_state_dirty_keys.discard(key)
+        _rlm_state_deleted_keys.add(key)
         return super().pop(key, default)
 
     def clear(self):
         for key in list(self.keys()):
-            __rlm_state_deleted_keys.add(str(key))
-            __rlm_state_dirty_keys.discard(str(key))
+            _rlm_state_deleted_keys.add(str(key))
+            _rlm_state_dirty_keys.discard(str(key))
         return super().clear()
 
     def update(self, other=(), **kwargs):
@@ -468,9 +514,9 @@ class __rlm_TrackingDict(dict):
 def __rlm_replace_state(payload):
     state.clear()
     for key, value in payload.items():
-        dict.__setitem__(state, str(key), value)
-    __rlm_state_deleted_keys.clear()
-    __rlm_state_dirty_keys.clear()
+        dict.__setitem__(state, str(key), _rlm_make_json_safe(value))
+    _rlm_state_deleted_keys.clear()
+    _rlm_state_dirty_keys.clear()
 
 state = __rlm_TrackingDict(json.loads(__rlm_shared_state_json))
 
@@ -479,14 +525,14 @@ def state_get(key, default=None):
 
 def state_set(key, value):
     key = str(key)
-    if key in __rlm_state_deleted_keys:
-        __rlm_state_deleted_keys.remove(key)
+    if key in _rlm_state_deleted_keys:
+        _rlm_state_deleted_keys.remove(key)
     state[key] = value
     return value
 
 def state_del(key):
     key = str(key)
-    __rlm_state_deleted_keys.add(key)
+    _rlm_state_deleted_keys.add(key)
     return state.pop(key, None)
 
 def state_keys():
@@ -649,6 +695,17 @@ def llm_query(prompts):
                 let code = "with open(__rlm_context_text_path, \"r\") as f:\n    context = f.read()\n";
                 vm.run_string(scope.clone(), code, "<rlm_context_text>".to_owned())?;
             }
+            if let Some(ref path_str) = full_text_path {
+                scope
+                    .globals
+                    .set_item(
+                        "__rlm_full_context_text_path",
+                        vm.ctx.new_str(path_str.as_str()).into(),
+                        vm,
+                    )?;
+                let code = "with open(__rlm_full_context_text_path, \"r\") as f:\n    full_context = f.read()\n";
+                vm.run_string(scope.clone(), code, "<rlm_full_context_text>".to_owned())?;
+            }
                 Ok(())
             })
             .map_err(|err: vm::PyRef<PyBaseException>| anyhow::anyhow!("python init error: {err:?}"))?;
@@ -756,6 +813,28 @@ def llm_query(prompts):
             })
     }
 
+    pub fn export_context(&self) -> anyhow::Result<Value> {
+        let _guard = self
+            .execution_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("repl execution lock poisoned"))?;
+        self.hydrate_shared_state()?;
+        let scope = self.scope.clone();
+        self.interpreter
+            .enter(|vm: &vm::VirtualMachine| -> vm::PyResult<Value> {
+                let context = scope.globals.get_item("context", vm).ok().or_else(|| {
+                    get_locals_dict(vm, &scope).and_then(|dict| dict.get_item("context", vm).ok())
+                });
+                let Some(context) = context else {
+                    return Ok(Value::Null);
+                };
+                py_object_to_json_value(vm, &context, &mut Vec::new())
+            })
+            .map_err(|err: vm::PyRef<PyBaseException>| {
+                anyhow::anyhow!("python context export error: {err:?}")
+            })
+    }
+
     pub fn get_cost_summary(&self) -> anyhow::Result<()> {
         anyhow::bail!("Cost tracking is not implemented for the REPL Environment.")
     }
@@ -796,80 +875,38 @@ def llm_query(prompts):
 
     fn sync_shared_state(&self) -> anyhow::Result<()> {
         let scope = self.scope.clone();
-        let (delta_json, deleted_json, fallback_flag) = self
+        let (changed_values, deleted_keys) = self
             .interpreter
             .enter(
-                |vm: &vm::VirtualMachine| -> vm::PyResult<(String, String, String)> {
-                    let sync_code =
-                        "import json\n__rlm_state_sync_fallback = '0'\nif '__rlm_TrackingDict' in \
-                         globals() and isinstance(state, __rlm_TrackingDict):\n    \
-                         __rlm_state_delta_payload = json.dumps({key: state.get(key) for key in \
-                         __rlm_state_dirty_keys})\n    __rlm_state_deleted_payload = \
-                         json.dumps(list(__rlm_state_deleted_keys))\n    \
-                         __rlm_state_dirty_keys.clear()\n    \
-                         __rlm_state_deleted_keys.clear()\nelse:\n    __rlm_state_sync_fallback = \
-                         '1'\n    __rlm_state_delta_payload = '{}'\n    \
-                         __rlm_state_deleted_payload = '[]'\n";
-                    vm.run_string(scope.clone(), sync_code, "<rlm_state_sync>".to_owned())?;
-                    let delta_json = get_string_from_scope(vm, &scope, "__rlm_state_delta_payload");
-                    let deleted_json =
-                        get_string_from_scope(vm, &scope, "__rlm_state_deleted_payload");
-                    let fallback_flag =
-                        get_string_from_scope(vm, &scope, "__rlm_state_sync_fallback");
-                    Ok((delta_json, deleted_json, fallback_flag))
+                |vm: &vm::VirtualMachine| -> vm::PyResult<(Value, Vec<String>)> {
+                    let state = scope.globals.get_item("state", vm)?;
+                    let dirty_keys = scope
+                        .globals
+                        .get_item("_rlm_state_dirty_keys", vm)
+                        .ok()
+                        .map(|value| py_object_to_string_vec(vm, &value))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let deleted_keys = scope
+                        .globals
+                        .get_item("_rlm_state_deleted_keys", vm)
+                        .ok()
+                        .map(|value| py_object_to_string_vec(vm, &value))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let changed_values = state_delta_to_json_value(vm, &state, &dirty_keys)?;
+                    clear_shared_state_tracking(vm, &scope)?;
+                    Ok((changed_values, deleted_keys))
                 },
             )
             .map_err(|err: vm::PyRef<PyBaseException>| {
-                anyhow::anyhow!(
-                    "shared state sync error (values must be JSON serializable): {err:?}"
-                )
+                anyhow::anyhow!("shared state sync error: {err:?}")
             })?;
-        if fallback_flag == "1" {
-            self.sync_shared_state_full(&scope)?;
-            self.last_hydrated_revision
-                .store(self.shared_state.revision(), Ordering::Release);
-            return Ok(());
-        }
-        let changed_values: Value = serde_json::from_str(&delta_json)
-            .map_err(|err| anyhow::anyhow!("shared state delta parse error: {err}"))?;
-        let deleted_keys: Vec<String> = serde_json::from_str(&deleted_json)
-            .map_err(|err| anyhow::anyhow!("shared state delete parse error: {err}"))?;
         self.shared_state
             .apply_delta_from_json(changed_values, &deleted_keys)?;
         self.last_hydrated_revision
             .store(self.shared_state.revision(), Ordering::Release);
         Ok(())
-    }
-
-    fn sync_shared_state_full(&self, scope: &Scope) -> anyhow::Result<()> {
-        let (state_json, deleted_json) = self
-            .interpreter
-            .enter(
-                |vm: &vm::VirtualMachine| -> vm::PyResult<(String, String)> {
-                    let sync_code = "import json\n__rlm_state_sync_payload = \
-                                     json.dumps(state)\n__rlm_state_deleted_payload = \
-                                     json.dumps(list(__rlm_state_deleted_keys))\nif \
-                                     '__rlm_state_dirty_keys' in globals():\n    \
-                                     __rlm_state_dirty_keys.clear()\n__rlm_state_deleted_keys.\
-                                     clear()\n";
-                    vm.run_string(scope.clone(), sync_code, "<rlm_state_sync_full>".to_owned())?;
-                    let state_json = get_string_from_scope(vm, scope, "__rlm_state_sync_payload");
-                    let deleted_json =
-                        get_string_from_scope(vm, scope, "__rlm_state_deleted_payload");
-                    Ok((state_json, deleted_json))
-                },
-            )
-            .map_err(|err: vm::PyRef<PyBaseException>| {
-                anyhow::anyhow!(
-                    "shared state full sync error (values must be JSON serializable): {err:?}"
-                )
-            })?;
-        let state_value: Value = serde_json::from_str(&state_json)
-            .map_err(|err| anyhow::anyhow!("shared state sync parse error: {err}"))?;
-        let deleted_keys: Vec<String> = serde_json::from_str(&deleted_json)
-            .map_err(|err| anyhow::anyhow!("shared state delete parse error: {err}"))?;
-        self.shared_state
-            .merge_from_json(state_value, &deleted_keys)
     }
 }
 
@@ -921,6 +958,14 @@ impl ReplCore {
         repl_env.get_variable(&name)
     }
 
+    fn export_context(&self) -> anyhow::Result<Value> {
+        let repl_env = self
+            .repl_env
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("repl env not initialized"))?;
+        repl_env.export_context()
+    }
+
     fn reset(&mut self) {
         self.repl_env = None;
     }
@@ -961,6 +1006,9 @@ impl ReplHandle {
                         }
                         ReplCommand::GetVariable { name, response } => {
                             let _ = response.send(core.get_variable(name));
+                        }
+                        ReplCommand::ExportContext { response } => {
+                            let _ = response.send(core.export_context());
                         }
                         ReplCommand::Reset { response } => {
                             core.reset();
@@ -1021,6 +1069,18 @@ impl ReplHandle {
             .map_err(|_| anyhow::anyhow!("repl worker dropped get_variable response"))?
     }
 
+    pub async fn export_context(&self) -> anyhow::Result<Value> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(ReplCommand::ExportContext {
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("failed to send export_context command to repl worker"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("repl worker dropped export_context response"))?
+    }
+
     pub async fn reset(&self) -> anyhow::Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
@@ -1077,6 +1137,147 @@ fn get_locals_dict(vm: &vm::VirtualMachine, scope: &Scope) -> Option<PyDictRef> 
         .get_item("__rlm_locals", vm)
         .ok()
         .and_then(|value| value.downcast::<vm::builtins::PyDict>().ok())
+}
+
+fn clear_shared_state_tracking(vm: &vm::VirtualMachine, scope: &Scope) -> vm::PyResult<()> {
+    for name in ["_rlm_state_dirty_keys", "_rlm_state_deleted_keys"] {
+        if let Ok(tracking) = scope.globals.get_item(name, vm) {
+            vm.call_method(&tracking, "clear", ())?;
+        }
+    }
+    Ok(())
+}
+
+fn state_delta_to_json_value(
+    vm: &vm::VirtualMachine,
+    state: &vm::PyObjectRef,
+    dirty_keys: &[String],
+) -> vm::PyResult<Value> {
+    let mut map = Map::with_capacity(dirty_keys.len());
+    for key in dirty_keys {
+        let value = vm.call_method(state, "__getitem__", (key.clone(),))?;
+        map.insert(
+            key.clone(),
+            py_object_to_json_value(vm, &value, &mut Vec::new())?,
+        );
+    }
+    Ok(Value::Object(map))
+}
+
+fn py_object_to_string(vm: &vm::VirtualMachine, value: &vm::PyObjectRef) -> vm::PyResult<String> {
+    if let Ok(text) = value.clone().try_to_value::<String>(vm) {
+        return Ok(text);
+    }
+    value
+        .repr(vm)
+        .or_else(|_| value.str(vm))
+        .map(|py_str| py_str.as_str().to_owned())
+}
+
+fn py_object_to_string_vec(
+    vm: &vm::VirtualMachine,
+    value: &vm::PyObjectRef,
+) -> vm::PyResult<Vec<String>> {
+    if let Ok(set) = value.clone().downcast::<PySet>() {
+        return set
+            .elements()
+            .into_iter()
+            .map(|item| py_object_to_string(vm, &item))
+            .collect();
+    }
+    if let Ok(list) = value.clone().downcast::<PyList>() {
+        return list
+            .borrow_vec()
+            .iter()
+            .map(|item| py_object_to_string(vm, item))
+            .collect();
+    }
+    if let Ok(tuple) = value.clone().downcast::<PyTuple>() {
+        return tuple
+            .as_slice()
+            .iter()
+            .map(|item| py_object_to_string(vm, item))
+            .collect();
+    }
+    Ok(Vec::new())
+}
+
+fn py_object_to_json_value(
+    vm: &vm::VirtualMachine,
+    value: &vm::PyObjectRef,
+    seen: &mut Vec<usize>,
+) -> vm::PyResult<Value> {
+    if vm.is_none(value) {
+        return Ok(Value::Null);
+    }
+    if let Ok(boolean) = value.clone().try_to_value::<bool>(vm) {
+        return Ok(Value::Bool(boolean));
+    }
+    if let Ok(text) = value.clone().try_to_value::<String>(vm) {
+        return Ok(Value::String(text));
+    }
+    if let Ok(integer) = value.clone().try_to_value::<i64>(vm) {
+        return Ok(Value::Number(integer.into()));
+    }
+    if let Ok(integer) = value.clone().try_to_value::<u64>(vm) {
+        return Ok(Value::Number(integer.into()));
+    }
+    if let Some(float) = value.downcast_ref::<PyFloat>() {
+        let float = float.to_f64();
+        return Ok(serde_json::Number::from_f64(float)
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::String(float.to_string())));
+    }
+
+    let object_id = value.get_id();
+    if seen.contains(&object_id) {
+        return Ok(Value::String("<recursive>".to_owned()));
+    }
+
+    if let Ok(dict) = value.clone().downcast::<PyDict>() {
+        seen.push(object_id);
+        let mut map = Map::new();
+        for (key, item) in dict.items_vec() {
+            map.insert(
+                py_object_to_string(vm, &key)?,
+                py_object_to_json_value(vm, &item, seen)?,
+            );
+        }
+        seen.pop();
+        return Ok(Value::Object(map));
+    }
+    if let Ok(list) = value.clone().downcast::<PyList>() {
+        seen.push(object_id);
+        let items = list
+            .borrow_vec()
+            .iter()
+            .map(|item| py_object_to_json_value(vm, item, seen))
+            .collect::<vm::PyResult<Vec<_>>>()?;
+        seen.pop();
+        return Ok(Value::Array(items));
+    }
+    if let Ok(tuple) = value.clone().downcast::<PyTuple>() {
+        seen.push(object_id);
+        let items = tuple
+            .as_slice()
+            .iter()
+            .map(|item| py_object_to_json_value(vm, item, seen))
+            .collect::<vm::PyResult<Vec<_>>>()?;
+        seen.pop();
+        return Ok(Value::Array(items));
+    }
+    if let Ok(set) = value.clone().downcast::<PySet>() {
+        seen.push(object_id);
+        let items = set
+            .elements()
+            .into_iter()
+            .map(|item| py_object_to_json_value(vm, &item, seen))
+            .collect::<vm::PyResult<Vec<_>>>()?;
+        seen.pop();
+        return Ok(Value::Array(items));
+    }
+
+    Ok(Value::String(py_object_to_string(vm, value)?))
 }
 
 fn collect_locals(vm: &vm::VirtualMachine, scope: &Scope, detailed: bool) -> Vec<LocalValue> {

@@ -73,6 +73,14 @@ impl SandboxHandle for SandboxClient {
         }
     }
 
+    fn reset(&mut self) -> Result<(), String> {
+        match self.send_request(&WorkerRequest::Reset)? {
+            WorkerResponse::Ack => Ok(()),
+            WorkerResponse::Error { message } => Err(message),
+            other => Err(format!("unexpected reset response: {other:?}")),
+        }
+    }
+
     fn terminate(&mut self) {
         self.shutdown_graceful();
         let _ = self.child.kill();

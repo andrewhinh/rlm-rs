@@ -11,6 +11,8 @@ node "app" as App {
   component "SessionActor(s)" as Actors
   component "PoolBrokerThread" as PoolBroker
   component "SandboxPool" as Pool
+  component "LaunchWorker(s)" as Launchers
+  component "RetireWorker(s)" as Retirers
 }
 
 node "docker" as DockerHost {
@@ -27,12 +29,15 @@ Ingress --> SessionManager : recv
 SessionManager --> ActorMap : route
 SessionManager --> Actors : dispatch
 
-Actors --> PoolBroker : acquire/retire
-PoolBroker --> Pool : single owner
-Pool --> DockerHost : docker run --runtime=runsc
+Actors --> PoolBroker : acquire / retire
+Actors --> Workers : reset / run(request)
+PoolBroker --> Pool : idle handles
+PoolBroker --> Launchers : launch
+PoolBroker --> Retirers : retire
+Launchers --> DockerHost : docker run + ping
+Retirers --> DockerHost : terminate + wait
 
-Actors --> Workers : run(request)
-Workers --> Repls : execute
+Workers --> Repls : reset / execute
 Repls --> State : state_get/state_set/state_del
 Repls --> OpenAI : async chat/completions
 
