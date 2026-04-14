@@ -11,7 +11,7 @@ anyhow = "1.0.100"
 async-trait = "0.1.89"
 dotenvy = "0.15.7"
 mimalloc = { version = "0.1.48", optional = true }
-rand = "0.9.2"
+rand = "0.9.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json"] }
 rustpython-pylib = { git = "https://github.com/RustPython/RustPython", version = "0.4.0", features = [
